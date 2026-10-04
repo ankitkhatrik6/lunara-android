@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <full-backup-content>
-    <!-- Keep the user's library (Room database) and preferences. -->
+    <!-- Back up the user's library (Room database) and preferences. Offline
+         downloads live in external storage and are intentionally not backed up,
+         so they do not need to be excluded here. -->
     <include domain="database" path="lunara_database" />
     <include domain="sharedpref" path="." />
-    <!-- Offline downloads live in external app storage and are re-downloadable. -->
-    <exclude domain="external" path="." />
 </full-backup-content>

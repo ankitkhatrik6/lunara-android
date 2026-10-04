@@ -3,7 +3,6 @@
     <cloud-backup>
         <include domain="database" path="lunara_database" />
         <include domain="sharedpref" path="." />
-        <exclude domain="external" path="." />
     </cloud-backup>
     <device-transfer>
         <include domain="database" path="lunara_database" />

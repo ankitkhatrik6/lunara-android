@@ -107,7 +107,7 @@ object StreamResolver {
             return null
         }
 
-        val candidates = (streamInfo.audioOnlyStreams.ifEmpty { streamInfo.audioStreams })
+        val candidates = streamInfo.audioStreams
             .filter { !it.content.isNullOrBlank() }
         val best: AudioStream? = candidates
             .filter { it.averageBitrate > 0 }

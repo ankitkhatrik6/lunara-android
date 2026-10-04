@@ -3,6 +3,6 @@
     <item
         android:width="66dp"
         android:height="66dp"
-        android:drawable="@drawable/lunara_logo_1791110033111"
+        android:drawable="@drawable/lunara_logo"
         android:gravity="center" />
 </layer-list>

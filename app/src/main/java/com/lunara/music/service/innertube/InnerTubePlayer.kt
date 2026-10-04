@@ -22,7 +22,7 @@ import java.util.concurrent.TimeUnit
 object InnerTubePlayer {
     private const val TAG = "InnerTubePlayer"
     private const val BASE = "https://music.youtube.com/youtubei/v1"
-    private const val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
+    private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)

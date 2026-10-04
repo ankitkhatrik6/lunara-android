@@ -33,8 +33,8 @@ android {
     // Increment versionCode for every published update. A stable applicationId,
     // a stable signing key and a strictly increasing versionCode together are
     // what allow an APK to be installed over a previous build.
-    versionCode = 1
-    versionName = "1.0.0"
+    versionCode = 2
+    versionName = "1.1.0"
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 
@@ -111,9 +111,8 @@ dependencies {
   implementation(libs.androidx.media3.ui)
   implementation(libs.androidx.media3.datasource.okhttp)
 
-  // YouTube Music InnerTube metadata + Blazify stream extraction engine
-  // (signature deobfuscation and PoToken generation).
-  implementation(libs.blazify.extractor)
+  // In-app YouTube InnerTube stream extraction and lyrics. No external
+  // extractor dependency is used.
   implementation(libs.okhttp)
 
   implementation(libs.kotlinx.coroutines.android)

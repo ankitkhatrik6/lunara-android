@@ -22,10 +22,6 @@ kotlinxCoroutinesCore = "1.10.2"
 okhttp = "4.10.0"
 robolectric = "4.16.1"
 media3 = "1.5.1"
-# BlazifyExtractor is the stream-extraction engine that powers Blazify: a
-# maintained fork of NewPipeExtractor with YouTube signature (cipher)
-# deobfuscation and PoToken generation. Served through JitPack.
-blazifyExtractor = "v1.0.0"
 
 
 [libraries]
@@ -61,7 +57,6 @@ androidx-media3-exoplayer = { group = "androidx.media3", name = "media3-exoplaye
 androidx-media3-session = { group = "androidx.media3", name = "media3-session", version.ref = "media3" }
 androidx-media3-ui = { group = "androidx.media3", name = "media3-ui", version.ref = "media3" }
 androidx-media3-datasource-okhttp = { group = "androidx.media3", name = "media3-datasource-okhttp", version.ref = "media3" }
-blazify-extractor = { group = "com.github.rajendra7169", name = "BlazifyExtractor", version.ref = "blazifyExtractor" }
 
 
 [plugins]

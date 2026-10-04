@@ -94,7 +94,7 @@ fun FullPlayerScreen(
     LaunchedEffect(song?.id, isLyricsMode) {
         if (song != null && (isLyricsMode || lyricsData == null) && lyricsData?.songTitle != song.title) {
             isLoadingLyrics = true
-            lyricsData = LyricsService.getLyrics(song.title, song.artist, song.durationSeconds)
+            lyricsData = LyricsService.getLyrics(song.title, song.artist, song.durationSeconds, song.id)
             isLoadingLyrics = false
         }
     }

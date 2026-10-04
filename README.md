@@ -17,12 +17,13 @@ tracking, and no account required.
 
 - YouTube Music catalogue: search, live suggestions, browse, artists, albums,
   and playlists through the InnerTube `WEB_REMIX` client.
-- Reliable playback: the best available audio stream is resolved per track with
-  the [BlazifyExtractor](https://github.com/rajendra7169/blazifyextractor) engine,
-  which performs YouTube signature deobfuscation and PoToken handling, and is
-  played through Media3 with lock screen and notification controls.
-- Time synced and plain lyrics from [LRCLIB](https://lrclib.net), matched with a
-  scored title, artist, and duration search.
+- Reliable playback: the playable audio stream is resolved per track directly
+  against the InnerTube player endpoint using several public client identities
+  (Android VR, iOS, Android Creator, TV embedded and Web Music), so no external
+  extractor library and no JavaScript engine are required. Playback runs through
+  Media3 with lock screen and notification controls.
+- Time synced and plain lyrics with a priority chain of providers: Paxsenix,
+  LRCLIB, Better Lyrics, KuGou and LyricsPlus.
 - Queue management: play next, add to queue, reorder, remove, and clear.
 - Mini player and full player: scrubbable seek bar, repeat (all, one, off),
   shuffle, and a sleep timer.
@@ -72,8 +73,8 @@ app/src/main/java/com/lunara/music/
 
 - Platform: Android, Kotlin, Jetpack Compose, Material 3
 - Audio: AndroidX Media3 (ExoPlayer and MediaSession) with an OkHttp data source
-- Extraction: InnerTube metadata client and BlazifyExtractor stream engine
-- Lyrics: LRCLIB
+- Extraction: in-app InnerTube client (player endpoint with client rotation)
+- Lyrics: Paxsenix, LRCLIB, Better Lyrics, KuGou and LyricsPlus
 - Database: AndroidX Room
 - Images: Coil
 - Networking: OkHttp 4

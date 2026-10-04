@@ -1,44 +1,34 @@
 package com.lunara.music.service.innertube
 
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
-import org.schabi.newpipe.extractor.NewPipe
-import org.schabi.newpipe.extractor.ServiceList
-import org.schabi.newpipe.extractor.exceptions.ExtractionException
-import org.schabi.newpipe.extractor.localization.ContentCountry
-import org.schabi.newpipe.extractor.localization.Localization
-import org.schabi.newpipe.extractor.stream.AudioStream
-import org.schabi.newpipe.extractor.stream.StreamInfo
 import java.util.concurrent.TimeUnit
 
 /**
  * Resolves a YouTube Music video id into a directly playable audio URL.
  *
- * The primary engine is BlazifyExtractor, the same stream-extraction library
- * that powers Blazify. It resolves the best audio stream for the current network
- * and device and performs the YouTube signature (cipher) deobfuscation and
- * PoToken handling that a raw InnerTube `/player` response requires.
- *
- * When the extractor cannot produce a URL (region locks, transient upstream
- * changes) we fall back to public Piped / Invidious mirrors.
+ * Resolution is done entirely in process by [InnerTubePlayer], which talks to
+ * the InnerTube `/player` endpoint and reads a plain (non-ciphered) audio URL.
+ * No external extractor library is used. Public Piped / Invidious mirrors are
+ * kept only as a last resort safety net.
  */
 object StreamResolver {
     private const val TAG = "StreamResolver"
     private const val CACHE_TTL_MS = 30 * 60 * 1000L
     private const val MAX_CACHE_ENTRIES = 48
 
-    private val client = OkHttpClient.Builder()
+    private val mirrorClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
-
-    @Volatile
-    private var isInitialized = false
 
     private data class CachedUrl(val url: String, val resolvedAt: Long)
 
@@ -47,45 +37,35 @@ object StreamResolver {
             size > MAX_CACHE_ENTRIES
     }
 
+    private val warmupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** Warm the visitor id so the first song resolves without an extra round trip. */
     fun init() {
-        if (isInitialized) return
-        synchronized(this) {
-            if (isInitialized) return
-            try {
-                NewPipe.init(
-                    LunaraDownloader(client),
-                    Localization.DEFAULT,
-                    ContentCountry.DEFAULT
-                )
-                isInitialized = true
-                Log.d(TAG, "Stream extractor initialized")
-            } catch (e: Throwable) {
-                Log.e(TAG, "Failed to initialize stream extractor", e)
-            }
-        }
+        warmupScope.launch { runCatching { InnerTubePlayer.ensureVisitorData() } }
     }
 
-    /**
-     * Returns a playable audio URL for [videoId], or null when nothing could be
-     * resolved. Resolved URLs are cached briefly because they are time limited.
-     */
     suspend fun resolveStreamUrl(videoId: String): String? = withContext(Dispatchers.IO) {
         if (videoId.isBlank()) return@withContext null
-
         cached(videoId)?.let { return@withContext it }
 
-        val fromExtractor = runCatching { extractWithBlazify(videoId) }
-            .onFailure { Log.w(TAG, "Extractor failed for $videoId: ${it.message}") }
-            .getOrNull()
-        if (!fromExtractor.isNullOrBlank()) {
-            store(videoId, fromExtractor)
-            return@withContext fromExtractor
+        // 1. InnerTube player. Clients that return direct audio URLs are tried first.
+        for (client in InnerTubeClients.STREAM_CLIENTS) {
+            val response = runCatching { InnerTubePlayer.fetchPlayerResponse(client, videoId) }
+                .getOrNull() ?: continue
+            val url = InnerTubePlayer.selectAudioUrl(response)
+            if (!url.isNullOrBlank() && InnerTubePlayer.validateUrl(url)) {
+                Log.d(TAG, "Resolved $videoId via ${client.clientName}")
+                store(videoId, url)
+                return@withContext url
+            }
         }
 
-        val fromMirror = resolveViaMirrors(videoId)
-        if (!fromMirror.isNullOrBlank()) {
-            store(videoId, fromMirror)
-            return@withContext fromMirror
+        // 2. Public mirrors as a safety net.
+        val mirror = resolveViaMirrors(videoId)
+        if (!mirror.isNullOrBlank()) {
+            Log.d(TAG, "Resolved $videoId via mirror")
+            store(videoId, mirror)
+            return@withContext mirror
         }
 
         Log.e(TAG, "Could not resolve a playable stream for $videoId")
@@ -97,37 +77,7 @@ object StreamResolver {
         synchronized(cache) { cache.remove(videoId) }
     }
 
-    private fun extractWithBlazify(videoId: String): String? {
-        init()
-        val service = ServiceList.YouTube
-        val streamInfo = try {
-            StreamInfo.getInfo(service, "https://www.youtube.com/watch?v=$videoId")
-        } catch (e: ExtractionException) {
-            Log.w(TAG, "Extraction exception for $videoId: ${e.message}")
-            return null
-        }
-
-        val candidates = streamInfo.audioStreams
-            .filter { !it.content.isNullOrBlank() }
-        val best: AudioStream? = candidates
-            .filter { it.averageBitrate > 0 }
-            .maxByOrNull { it.averageBitrate }
-            ?: candidates.firstOrNull()
-
-        if (best != null && !best.content.isNullOrBlank()) {
-            Log.d(
-                TAG,
-                "Resolved $videoId via BlazifyExtractor " +
-                    "(${best.averageBitrate} kbps, ${best.format})"
-            )
-            return best.content
-        }
-        return null
-    }
-
     private fun resolveViaMirrors(videoId: String): String? {
-        // Best-effort public mirrors. These are only a safety net; the extractor
-        // above is the primary path.
         val instances = listOf(
             "https://pipedapi.kavin.rocks/streams/$videoId",
             "https://pipedapi.adminforge.de/streams/$videoId",
@@ -135,13 +85,9 @@ object StreamResolver {
             "https://inv.nadeko.net/api/v1/videos/$videoId",
             "https://invidious.nerdvpn.de/api/v1/videos/$videoId"
         )
-
         for (instance in instances) {
             val url = runCatching { queryMirror(instance) }.getOrNull()
-            if (!url.isNullOrBlank()) {
-                Log.d(TAG, "Resolved $videoId via mirror $instance")
-                return url
-            }
+            if (!url.isNullOrBlank()) return url
         }
         return null
     }
@@ -152,12 +98,12 @@ object StreamResolver {
             .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             .build()
 
-        client.newCall(req).execute().use { resp ->
+        mirrorClient.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) return null
             val body = resp.body?.string() ?: return null
             val json = JSONObject(body)
 
-            // Piped: { "audioStreams": [ { "url", "bitrate", "mimeType" } ] }
+            // Piped: { "audioStreams": [ { "url", "bitrate" } ] }
             json.optJSONArray("audioStreams")?.let { streams ->
                 var bestUrl: String? = null
                 var bestBitrate = -1

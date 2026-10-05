@@ -298,7 +298,16 @@ object InnerTubeService {
                 ?.optJSONObject("musicPlayButtonRenderer")
                 ?.optJSONObject("playNavigationEndpoint")
 
+        // Album/playlist rows often carry the playable id only in
+        // playlistItemData (or the menu's play command), not in any navigation
+        // endpoint — without this fallback every such row is silently dropped
+        // and detail screens show "0 songs".
         val videoId = nav?.optJSONObject("watchEndpoint")?.optString("videoId")
+            ?.takeIf { it.isNotBlank() }
+            ?: item.optJSONObject("playlistItemData")?.optString("videoId")
+                ?.takeIf { it.isNotBlank() }
+            ?: item.optString("videoId").takeIf { it.isNotBlank() }
+            ?: menuVideoId(item)
         val browseId = nav?.optJSONObject("browseEndpoint")?.optString("browseId")
 
         if (!videoId.isNullOrBlank()) {
@@ -325,6 +334,24 @@ object InnerTubeService {
                 }
             }
         }
+    }
+
+    /**
+     * Pulls a video id out of the row's overflow-menu play commands.
+     * Some album/playlist responses only embed the id there.
+     */
+    private fun menuVideoId(item: JSONObject): String? {
+        val items = item.optJSONObject("menu")?.optJSONObject("menuRenderer")
+            ?.optJSONArray("items") ?: return null
+        for (i in 0 until items.length()) {
+            val id = items.optJSONObject(i)
+                ?.optJSONObject("menuNavigationItemRenderer")
+                ?.optJSONObject("navigationEndpoint")
+                ?.optJSONObject("watchEndpoint")
+                ?.optString("videoId")?.takeIf { it.isNotBlank() }
+            if (id != null) return id
+        }
+        return null
     }
 
     suspend fun getHome(): Map<String, List<Any>> = withContext(Dispatchers.IO) {
@@ -435,41 +462,45 @@ object InnerTubeService {
                 val thumb = extractThumbnail(header?.optJSONObject("thumbnail"))
 
                 val tracks = mutableListOf<Song>()
-                val contents = json.optJSONObject("contents")
+                // Albums arrive in several layouts: musicShelfRenderer under the
+                // first section, musicPlaylistShelfRenderer, or a bare list of
+                // items. Walk every section and accept any of them.
+                val sections = json.optJSONObject("contents")
                     ?.optJSONObject("singleColumnBrowseResultsRenderer")
                     ?.optJSONArray("tabs")
                     ?.optJSONObject(0)
                     ?.optJSONObject("tabRenderer")
                     ?.optJSONObject("content")
                     ?.optJSONObject("sectionListRenderer")
-                    ?.optJSONArray("contents")
-                    ?.optJSONObject(0)
-                    ?.optJSONObject("musicShelfRenderer")
                     ?.optJSONArray("contents") ?: JSONArray()
 
-                for (i in 0 until contents.length()) {
-                    val item = contents.optJSONObject(i)?.optJSONObject("musicResponsiveListItemRenderer") ?: continue
-                    val flexCols = item.optJSONArray("flexColumns") ?: continue
-                    val trackTitle = extractRunsText(flexCols.optJSONObject(0)?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")?.optJSONObject("text"))
-                    val durationStr = extractRunsText(flexCols.optJSONObject(1)?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")?.optJSONObject("text"))
-                    val nav = item.optJSONObject("overlay")
-                        ?.optJSONObject("musicItemThumbnailOverlayRenderer")
-                        ?.optJSONObject("content")
-                        ?.optJSONObject("musicPlayButtonRenderer")
-                        ?.optJSONObject("playNavigationEndpoint")
-                        ?: item.optJSONObject("navigationEndpoint")
-
-                    val videoId = nav?.optJSONObject("watchEndpoint")?.optString("videoId") ?: continue
-                    tracks.add(
-                        Song(
-                            id = videoId,
-                            title = trackTitle,
-                            artist = subtitle,
-                            album = title,
-                            durationSeconds = parseDuration(durationStr),
-                            thumbnailUrl = thumb
-                        )
-                    )
+                for (s in 0 until sections.length()) {
+                    val sec = sections.optJSONObject(s) ?: continue
+                    val contents = sec.optJSONObject("musicShelfRenderer")?.optJSONArray("contents")
+                        ?: sec.optJSONObject("musicPlaylistShelfRenderer")?.optJSONArray("contents")
+                        ?: continue
+                    for (i in 0 until contents.length()) {
+                        val item = contents.optJSONObject(i)
+                            ?.optJSONObject("musicResponsiveListItemRenderer") ?: continue
+                        val before = tracks.size
+                        val tmpAlbums = mutableListOf<Album>()
+                        val tmpPlaylists = mutableListOf<Playlist>()
+                        // Reuse the hardened item parser (playlistItemData/menu
+                        // fallbacks) instead of hand-rolling nav extraction that
+                        // drops rows and yields "0 songs".
+                        parseListItem(item, tracks, mutableListOf(), tmpAlbums, tmpPlaylists)
+                        // Stamp album context on freshly added rows.
+                        for (k in before until tracks.size) {
+                            val t = tracks[k]
+                            if (t.album.isNullOrBlank() || t.thumbnailUrl.isNullOrBlank()) {
+                                tracks[k] = t.copy(
+                                    album = t.album?.takeIf { it.isNotBlank() } ?: title,
+                                    artist = t.artist.takeIf { it.isNotBlank() && it != "Unknown Artist" } ?: subtitle,
+                                    thumbnailUrl = t.thumbnailUrl?.takeIf { it.isNotBlank() } ?: thumb,
+                                )
+                            }
+                        }
+                    }
                 }
 
                 return@withContext Album(
@@ -635,6 +666,15 @@ object InnerTubeService {
                         parseListItem(item, songsTemp, mutableListOf(), mutableListOf(), mutableListOf())
                         tracks.addAll(songsTemp)
                     }
+                    // Keep paging: each shelf can hand us the token for the next
+                    // page. Without this a long playlist stops after ~100 tracks.
+                    shelf.optJSONArray("continuations")?.optJSONObject(0)
+                        ?.optJSONObject("nextContinuationData")?.optString("continuation")
+                        ?.takeIf { it.isNotBlank() }?.let { next ->
+                            if (tracks.size < 500) {
+                                runCatching { tracks.addAll(getPlaylistContinuation(next)) }
+                            }
+                        }
                 }
 
                 return@withContext tracks

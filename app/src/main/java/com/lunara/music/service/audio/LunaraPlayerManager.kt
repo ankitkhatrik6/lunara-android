@@ -263,6 +263,8 @@ object LunaraPlayerManager {
         loadAndPlay(songs[validIndex])
     }
 
+    private var loadJob: Job? = null
+
     private fun loadAndPlay(song: Song) {
         _currentSong.value = song
         songRetryCount = 0
@@ -279,13 +281,19 @@ object LunaraPlayerManager {
         // Record history in local Room database
         serviceContext?.let { ctx ->
             scope.launch(Dispatchers.IO) {
-                val db = LunaraDatabase.getDatabase(ctx)
-                db.songDao().insertOrUpdateSong(song.toEntity())
-                db.songDao().recordPlay(song.id, System.currentTimeMillis())
+                runCatching {
+                    val db = LunaraDatabase.getDatabase(ctx)
+                    db.songDao().insertOrUpdateSong(song.toEntity())
+                    db.songDao().recordPlay(song.id, System.currentTimeMillis())
+                }
             }
         }
 
-        scope.launch {
+        // Cancel any in-flight resolve so rapid taps never pile up resolves on
+        // the (single) main-thread scope — that pile-up is what froze the UI
+        // into "Lunara isn't responding". Only the latest tap keeps running.
+        loadJob?.cancel()
+        loadJob = scope.launch(Dispatchers.IO) {
             // 1. A downloaded file on disk always wins.
             val localFile = song.localFilePath
                 ?.takeIf { it.isNotBlank() }
@@ -313,30 +321,44 @@ object LunaraPlayerManager {
             // through clients, because without a token YouTube either bot-gates the
             // request or hands back a URL whose media is capped at 1 MiB — which
             // ExoPlayer experiences as an endless buffer rather than as an error.
-            val stream = when (val outcome = StreamResolver.resolve(song.id)) {
-                is StreamResolver.Outcome.Success -> outcome.stream
-                is StreamResolver.Outcome.Failure -> {
-                    _isBuffering.value = false
-                    // Say what actually went wrong. "Couldn't stream this song" for a
-                    // track YouTube has removed is technically true and completely
-                    // useless, and that vagueness is how a broken player passes for a
-                    // working one that simply has no music.
-                    _playbackError.value = when (outcome.reason) {
-                        is ResolveFailure.Unavailable ->
-                            "This song isn't available on YouTube Music"
+            // Bounded so a dead network/token can never pin the player in a
+            // buffering state forever (which the UI reads as a hang).
+            val stream = try {
+                withTimeout(45_000L) {
+                    when (val outcome = StreamResolver.resolve(song.id)) {
+                        is StreamResolver.Outcome.Success -> outcome.stream
+                        is StreamResolver.Outcome.Failure -> {
+                            _isBuffering.value = false
+                            // Say what actually went wrong. "Couldn't stream this song" for a
+                            // track YouTube has removed is technically true and completely
+                            // useless, and that vagueness is how a broken player passes for a
+                            // working one that simply has no music.
+                            _playbackError.value = when (outcome.reason) {
+                                is ResolveFailure.Unavailable ->
+                                    "This song isn't available on YouTube Music"
 
-                        is ResolveFailure.Blocked ->
-                            "YouTube is rate-limiting this device. Try again shortly."
+                                is ResolveFailure.Blocked ->
+                                    "YouTube is rate-limiting this device. Try again shortly."
 
-                        is ResolveFailure.NoPlayableStream ->
-                            "YouTube throttled the stream. Try again in a moment."
+                                is ResolveFailure.NoPlayableStream ->
+                                    "YouTube throttled the stream. Try again in a moment."
 
-                        is ResolveFailure.Network ->
-                            "No connection to YouTube. Check your network."
+                                is ResolveFailure.Network ->
+                                    "No connection to YouTube. Check your network."
+                            }
+                            Log.w(TAG, "Could not resolve ${song.id}: ${outcome.reason}")
+                            return@launch
+                        }
                     }
-                    Log.w(TAG, "Could not resolve ${song.id}: ${outcome.reason}")
-                    return@launch
                 }
+            } catch (e: CancellationException) {
+                // Superseded by a newer tap, or the scope died — stay silent.
+                throw e
+            } catch (e: Exception) {
+                _isBuffering.value = false
+                _playbackError.value = "Couldn't start this song. Check your connection and retry."
+                Log.w(TAG, "Resolve for ${song.id} failed: ${e.message}")
+                return@launch
             }
 
             // Bind the minting identity to this URL so the data source sends the

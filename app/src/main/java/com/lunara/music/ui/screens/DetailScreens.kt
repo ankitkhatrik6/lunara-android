@@ -73,12 +73,13 @@ fun PlaylistDetailScreen(
                 songs = remotePl.tracks
             }
         } else {
-            // Local Database playlist
+            // Local Database playlist. Use the one-shot query: collecting the
+            // Flow here never returns, so isLoading stayed true forever and the
+            // screen sat on a spinner showing "0 songs".
             withContext(Dispatchers.IO) {
                 playlistInfo = db.playlistDao().getPlaylistById(playlistId)
-                db.playlistDao().getSongsForPlaylist(playlistId).collect { entities ->
-                    songs = entities.map { Song.fromEntity(it) }
-                }
+                songs = db.playlistDao().getSongsForPlaylistOnce(playlistId)
+                    .map { Song.fromEntity(it) }
             }
         }
         isLoading = false

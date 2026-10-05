@@ -2,9 +2,11 @@ package com.lunara.extractor.potoken
 
 import android.content.Context
 import android.webkit.CookieManager
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -53,22 +55,25 @@ object PoTokenGenerator {
      *
      * Null is a normal answer, not a failure: the caller then falls back to clients
      * that serve without one. Callers must never treat it as fatal.
+     *
+     * Suspends instead of blocking: an earlier version used `runBlocking` here,
+     * which deadlocked whenever resolution ran on the main thread (the WebView
+     * bootstrap itself needs the main thread), freezing the app into an ANR on
+     * every tap. Never block a thread waiting for the renderer.
      */
-    fun tokensFor(videoId: String, visitorData: String?): PoTokenResult? {
+    suspend fun tokensFor(videoId: String, visitorData: String?): PoTokenResult? {
         if (!webViewSupported || webViewUnusable) return null
         // BotGuard binds a token to a session, and a visitor session that has not been
         // minted yet has nothing to bind to.
         val session = visitorData?.takeIf { it.isNotBlank() } ?: return null
 
         return try {
-            runBlocking {
-                withTimeout(GENERATE_TIMEOUT_MS) { tokensForInternal(videoId, session) }
-            }
+            withTimeout(GENERATE_TIMEOUT_MS) { tokensForInternal(videoId, session) }
         } catch (e: TimeoutCancellationException) {
             // The renderer can be culled by the OS under memory pressure, which leaves
             // the WebView call hung for good. Cap it so resolution falls through to the
             // no-token clients instead of blocking playback indefinitely.
-            runBlocking { discardWebView() }
+            discardWebView()
             null
         } catch (e: BadWebViewException) {
             webViewUnusable = true
@@ -76,7 +81,7 @@ object PoTokenGenerator {
         } catch (e: Exception) {
             // Transient: a bad challenge, a dropped renderer, a network blip. Drop the
             // instance so the next attempt starts from a clean one.
-            runBlocking { discardWebView() }
+            runCatching { discardWebView() }
             null
         }
     }
@@ -131,14 +136,19 @@ object PoTokenGenerator {
     fun prewarm(context: Context) {
         if (!webViewSupported || webViewUnusable) return
         appContext = context.applicationContext
-        runCatching {
-            runBlocking {
+        // Never block the caller: prewarm runs fully in the background. The old
+        // runBlocking here stalled app startup (and any tap that raced it) while
+        // BootGuard's WebView bootstrap waited on the main thread -> ANR.
+        prewarmScope.launch {
+            runCatching {
                 withTimeout(GENERATE_TIMEOUT_MS) {
                     lock.withLock { obtainWebView("warmup") }
                 }
             }
         }
     }
+
+    private val prewarmScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Volatile
     private var appContext: Context? = null

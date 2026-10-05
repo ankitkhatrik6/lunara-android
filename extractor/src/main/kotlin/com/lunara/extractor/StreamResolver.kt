@@ -7,9 +7,11 @@ import com.lunara.extractor.potoken.PoTokenResult
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
 
 /**
  * Turns a video id into a stream that has been proven to serve data.
@@ -48,10 +50,23 @@ object StreamResolver {
     }
 
     /**
-     * Serialises resolution so a burst of taps on one track costs one resolve, not one
-     * per tap.
+     * One lock per track, so a slow resolve for one song never queues taps on
+     * other songs behind it. The old single global lock meant tapping song B
+     * while song A was still resolving (token mint + several client round
+     * trips, easily 30s+) parked B's coroutine for the whole duration — with
+     * the player scope on Main that read as a full-app hang -> ANR.
      */
-    private val resolveLock = Mutex()
+    private val videoLocks = LinkedHashMap<String, Mutex>()
+    private val videoLocksGuard = Any()
+
+    private fun lockFor(videoId: String): Mutex = synchronized(videoLocksGuard) {
+        // Bound the map so a long session can't grow it without limit.
+        if (videoLocks.size > 64) {
+            val oldest = videoLocks.keys.firstOrNull()
+            if (oldest != null) videoLocks.remove(oldest)
+        }
+        videoLocks.getOrPut(videoId) { Mutex() }
+    }
 
     private val warmupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -90,9 +105,14 @@ object StreamResolver {
 
         cached(videoId)?.let { return Outcome.Success(it) }
 
-        return resolveLock.withLock {
-            // Another caller may have resolved this while this one waited for the lock.
-            cached(videoId)?.let { return@withLock Outcome.Success(it) }
+        // Per-track lock only (see lockFor), and the whole resolve is bounded:
+        // token mint (8s) + several clients x (player call + probes) can
+        // otherwise run for minutes while the UI shows an endless spinner.
+        return try {
+            withTimeout(RESOLVE_TIMEOUT_MS) {
+                lockFor(videoId).withLock {
+                    // Another caller may have resolved this while this one waited for the lock.
+                    cached(videoId)?.let { return@withLock Outcome.Success(it) }
 
             val visitorData = SessionStore.ensure()
             // One token set serves every client: it is bound to the session, not to a
@@ -119,8 +139,16 @@ object StreamResolver {
 
             if (outcome is Outcome.Success) store(videoId, outcome.stream)
             outcome
+                }
+            }
+        } catch (e: TimeoutCancellationException) {
+            Log.w(TAG, "Resolve for $videoId timed out after ${RESOLVE_TIMEOUT_MS}ms")
+            Outcome.Failure(ResolveFailure.Network("Resolving took too long. Check your connection."))
         }
     }
+
+    /** Whole-resolve budget: token + rotation + probes must never hang the UI. */
+    private const val RESOLVE_TIMEOUT_MS = 60_000L
 /** One full pass over the client rotation. */
     private suspend fun resolveOnce(
         videoId: String,

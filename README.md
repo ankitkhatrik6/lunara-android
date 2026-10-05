@@ -51,7 +51,7 @@ Lunara is a free and open source music player for Android. It streams the YouTub
 | Feature | Description |
 |---------|-------------|
 | **YouTube Music catalogue** | Search, live suggestions, browse, artists, albums, and playlists through the InnerTube `WEB_REMIX` client. |
-| **Reliable playback** | The playable audio stream is resolved per track directly against the InnerTube player endpoint using several public client identities (Android VR, iOS, Android Creator, TV embedded, and Web Music), so no external extractor library and no JavaScript engine are required. Playback runs through Media3 with lock screen and notification controls. |
+| **Reliable playback** | Each track is resolved against the InnerTube player endpoint with a rotating set of public client identities, and every candidate URL is **proven playable before it reaches the player** — Lunara probes past the 1 MiB Google Video Server throttle boundary so a truncated stream is rejected and re-resolved instead of stalling in the buffer. Resolved streams carry the minting client's identity headers, the `n` throttling parameter is transformed from `player.js`, and a stall watchdog re-resolves a dead stream automatically. Playback runs through Media3 with lock screen and notification controls. |
 | **Synced lyrics** | Time-synced and plain lyrics with a priority chain of providers: Paxsenix, LRCLIB, Better Lyrics, KuGou, and LyricsPlus. |
 | **Queue management** | Play next, add to queue, reorder, remove, and clear. |
 | **Mini player and full player** | Scrubbable seek bar, repeat (all, one, off), shuffle, and a sleep timer. |
@@ -96,7 +96,7 @@ app/src/main/java/com/lunara/music/
 |------|--------|
 | Platform | Android, Kotlin, Jetpack Compose, Material 3 |
 | Audio | AndroidX Media3 (ExoPlayer and MediaSession) with an OkHttp data source |
-| Extraction | In-app InnerTube client (player endpoint with client rotation) |
+| Extraction | In-app InnerTube client (player endpoint, client rotation, signature + `n` throttling decipher) and deep stream validation |
 | Lyrics | Paxsenix, LRCLIB, Better Lyrics, KuGou, and LyricsPlus |
 | Database | AndroidX Room |
 | Images | Coil |

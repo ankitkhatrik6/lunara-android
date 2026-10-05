@@ -55,19 +55,22 @@ class DownloadManager(private val context: Context) {
             // First ensure song is in database
             db.songDao().insertOrUpdateSong(song.toEntity())
 
-            // Resolve stream URL
+            // Resolve a stream that has already been deep-validated, so we never start a
+            // download against a URL YouTube will truncate at 1 MiB.
             updateProgress(song.id, 0.15f)
-            val streamUrl = song.streamUrl ?: StreamResolver.resolveStreamUrl(song.id)
+            val candidate = StreamResolver.resolve(song.id)
 
-            if (streamUrl.isNullOrBlank()) {
+            if (candidate == null) {
                 updateProgress(song.id, 0f, error = "Could not resolve audio stream")
                 activeJobs.remove(song.id)
                 return@withContext
             }
 
+            // The download must be signed with the identity that minted the URL,
+            // otherwise the CDN rejects it past the first megabyte.
             val req = Request.Builder()
-                .url(streamUrl)
-                .addHeader("User-Agent", "Mozilla/5.0")
+                .url(candidate.url)
+                .apply { candidate.headers.forEach { (k, v) -> header(k, v) } }
                 .build()
 
             val outputFile = File(getDownloadsDir(), "${song.id}.m4a")
@@ -80,7 +83,7 @@ class DownloadManager(private val context: Context) {
                 }
 
                 val body = resp.body ?: throw IllegalStateException("Empty body")
-                val totalBytes = body.contentLength()
+                val expectedBytes = if (candidate.contentLength > 0) candidate.contentLength else body.contentLength()
                 var downloadedBytes = 0L
 
                 body.byteStream().use { input ->
@@ -90,13 +93,23 @@ class DownloadManager(private val context: Context) {
                         while (input.read(buffer).also { read = it } != -1) {
                             output.write(buffer, 0, read)
                             downloadedBytes += read
-                            if (totalBytes > 0) {
-                                val p = 0.2f + (downloadedBytes.toFloat() / totalBytes) * 0.8f
+                            if (expectedBytes > 0) {
+                                val p = 0.2f + (downloadedBytes.toFloat() / expectedBytes) * 0.8f
                                 updateProgress(song.id, p)
                             }
                         }
                         output.flush()
                     }
+                }
+
+                // A short read means the connection was cut: refuse to mark a
+                // truncated file as a successful download.
+                if (candidate.contentLength > 0 && downloadedBytes < candidate.contentLength) {
+                    outputFile.delete()
+                    updateProgress(song.id, 0f, error = "Stream ended early")
+                    StreamResolver.invalidate(song.id)
+                    activeJobs.remove(song.id)
+                    return@withContext
                 }
             }
 

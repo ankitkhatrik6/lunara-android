@@ -1,20 +1,20 @@
 package com.lunara.music.service.innertube
 
 /**
- * Minimal InnerTube client descriptor plus the client identities Lunara uses to
- * obtain playable audio streams.
+ * An InnerTube client identity plus the exact HTTP request identity needed to
+ * both mint a stream URL and later download from it.
  *
- * These are the same public client identities the Blazify project relies on.
- * Each client talks to the API base and origin matching its own family, exactly
- * as Blazify's InnerTube client does.
+ * BlazifyExtractor keeps the client identity together with the request it has to
+ * sign, because a googlevideo URL is only served to the same identity that
+ * minted it. Splitting those apart is what makes a player stall.
  */
 data class InnerTubeClient(
     val clientName: String,
-    val clientVersion: String,
+    /** Numeric id required by the `X-YouTube-Client-Name` header. */
     val clientId: String,
+    val clientVersion: String,
     val userAgent: String,
     val apiKey: String,
-    val baseUrl: String,
     val origin: String,
     val referer: String,
     val osName: String? = null,
@@ -23,9 +23,15 @@ data class InnerTubeClient(
     val deviceModel: String? = null,
     val androidSdkVersion: String? = null,
     val buildId: String? = null,
-    val isEmbedded: Boolean = false,
-    val useSignatureTimestamp: Boolean = false,
+    /**
+     * True when YouTube throttles this client's Google Video Server (media)
+     * requests to ~1 MiB unless a PO token is attached. Measured against the
+     * live API: iOS media is capped, Android VR media is not.
+     */
+    val gvsRequiresPoToken: Boolean = false,
 ) {
+    val baseUrl: String get() = origin
+
     fun toClientContext(visitorData: String?, hl: String, gl: String): org.json.JSONObject =
         org.json.JSONObject().apply {
             put("clientName", clientName)
@@ -40,11 +46,24 @@ data class InnerTubeClient(
             put("gl", gl)
             if (!visitorData.isNullOrBlank()) put("visitorData", visitorData)
         }
+
+    /**
+     * Headers the media CDN expects for a URL minted by this client. ExoPlayer
+     * must send these verbatim; sending a browser User-Agent for an iOS-minted
+     * URL is a reliable way to get a 403 halfway through a track.
+     */
+    fun mediaHeaders(): Map<String, String> = buildMap {
+        put("User-Agent", userAgent)
+        put("Referer", referer)
+        put("Origin", origin)
+        val visitor = YouTubeSession.visitorData
+        if (!visitor.isNullOrBlank()) put("X-Goog-Visitor-Id", visitor)
+    }
 }
 
 object InnerTubeClients {
     const val USER_AGENT_WEB =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0"
 
     const val MUSIC_BASE = "https://music.youtube.com"
     const val YOUTUBE_BASE = "https://www.youtube.com"
@@ -59,32 +78,26 @@ object InnerTubeClients {
     const val WARMUP_VIDEO_ID = "dQw4w9WgXcQ"
 
     /**
-     * Tried in order. Verified against the live catalogue: IOS returns direct
-     * (non-ciphered) audio URLs that validate with HTTP 206, so it leads and
-     * playback starts without any JavaScript deobfuscation. The remaining
-     * clients are kept as fallbacks; WEB_REMIX is last as a best effort.
+     * Rotation order, rebuilt from live measurements rather than guesswork.
+     *
+     * ANDROID_VR leads because its media URLs are *not* subject to the 1 MiB
+     * GVS throttle (yt-dlp's PO-Token Guide lists android_vr as "not
+     * required"). iOS is a proven fallback but its media is capped without a PO
+     * token, so it is flagged and every URL it produces is deep-validated.
+     *
+     * Clients that now answer LOGIN_REQUIRED / UNPLAYABLE for every catalogue
+     * track (ANDROID_CREATOR, TVHTML5 at v2.0, WEB_REMIX on www) are
+     * intentionally absent: keeping them only added four failed round trips to
+     * every single play, which is what made the app look "stuck".
      */
     val STREAM_CLIENTS: List<InnerTubeClient> = listOf(
         InnerTubeClient(
-            clientName = "IOS",
-            clientVersion = "21.03.1",
-            clientId = "5",
-            userAgent = "com.google.ios.youtube/21.03.1 (iPhone16,2; U; CPU iOS 18_2 like Mac OS X;)",
-            apiKey = KEY_IOS,
-            baseUrl = YOUTUBE_BASE,
-            origin = YOUTUBE_BASE,
-            referer = "$YOUTUBE_BASE/",
-            osName = "iOS",
-            osVersion = "18.2.22C152",
-        ),
-        InnerTubeClient(
             clientName = "ANDROID_VR",
-            clientVersion = "1.43.32",
             clientId = "28",
+            clientVersion = "1.43.32",
             userAgent = "com.google.android.apps.youtube.vr.oculus/1.43.32 " +
                 "(Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/107.0.5284.2)",
             apiKey = KEY_ANDROID,
-            baseUrl = YOUTUBE_BASE,
             origin = YOUTUBE_BASE,
             referer = "$YOUTUBE_BASE/",
             osName = "Android",
@@ -95,44 +108,50 @@ object InnerTubeClients {
             buildId = "SQ3A.220605.009.A1",
         ),
         InnerTubeClient(
-            clientName = "ANDROID_CREATOR",
-            clientVersion = "25.03.101",
-            clientId = "14",
-            userAgent = "com.google.android.apps.youtube.creator/25.03.101 " +
-                "(Linux; U; Android 15; en_US; Pixel 9 Pro Fold; Build/AP3A.241005.015.A2; Cronet/132.0.6779.0)",
+            clientName = "IOS",
+            clientId = "5",
+            clientVersion = "21.03.1",
+            userAgent = "com.google.ios.youtube/21.03.1 (iPhone16,2; U; CPU iOS 18_2 like Mac OS X;)",
+            apiKey = KEY_IOS,
+            origin = YOUTUBE_BASE,
+            referer = "$YOUTUBE_BASE/",
+            osName = "iOS",
+            osVersion = "18.2.22C152",
+            gvsRequiresPoToken = true,
+        ),
+        InnerTubeClient(
+            clientName = "ANDROID",
+            clientId = "3",
+            clientVersion = "20.10.38",
+            userAgent = "com.google.android.youtube/20.10.38 " +
+                "(Linux; U; Android 14; en_US; Pixel 8 Build/AP2A.240405.002; Cronet/130.0.6779.0) gzip",
             apiKey = KEY_ANDROID,
-            baseUrl = YOUTUBE_BASE,
             origin = YOUTUBE_BASE,
             referer = "$YOUTUBE_BASE/",
             osName = "Android",
-            osVersion = "15",
-            deviceMake = "Google",
-            deviceModel = "Pixel 9 Pro Fold",
-            androidSdkVersion = "35",
-            buildId = "AP3A.241005.015.A2",
+            osVersion = "14",
+            androidSdkVersion = "34",
+            gvsRequiresPoToken = true,
         ),
         InnerTubeClient(
             clientName = "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-            clientVersion = "2.0",
             clientId = "85",
+            clientVersion = "7.20250312.18.00",
             userAgent = "Mozilla/5.0 (PlayStation; PlayStation 4/12.02) AppleWebKit/605.1.15 " +
                 "(KHTML, like Gecko) Version/15.4 Safari/605.1.15",
             apiKey = KEY_WEB,
-            baseUrl = YOUTUBE_BASE,
             origin = YOUTUBE_BASE,
             referer = "$YOUTUBE_BASE/",
-            isEmbedded = true,
         ),
         InnerTubeClient(
-            clientName = "WEB_REMIX",
-            clientVersion = "1.20260213.01.00",
-            clientId = "67",
+            clientName = "WEB_EMBEDDED_PLAYER",
+            clientId = "56",
+            clientVersion = "1.20250310.01.00",
             userAgent = USER_AGENT_WEB,
-            apiKey = KEY_WEB_REMIX,
-            baseUrl = MUSIC_BASE,
-            origin = MUSIC_BASE,
-            referer = "$MUSIC_BASE/",
-            useSignatureTimestamp = true,
+            apiKey = KEY_WEB,
+            origin = YOUTUBE_BASE,
+            referer = "$YOUTUBE_BASE/",
+            gvsRequiresPoToken = true,
         ),
     )
 }

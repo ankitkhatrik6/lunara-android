@@ -25,6 +25,9 @@ object PlayerCipher {
     @Volatile private var cachedSts: Int? = null
     @Volatile private var cachedOps: List<DecipherOp>? = null
 
+    /** Cached operations of the `n` throttling function, keyed to the player.js build. */
+    @Volatile private var cachedNTransform: List<ThrottleOp>? = null
+
     fun initCache(dir: File) {
         if (cacheDir == null) {
             cacheDir = File(dir, "cipher_cache").apply { mkdirs() }
@@ -118,6 +121,125 @@ object PlayerCipher {
         Regex("""signatureTimestamp['":\s]+(\d+)""").find(js)?.groupValues?.get(1)
             ?.toIntOrNull()?.let { return it }
         return Regex("""sts['":\s]+(\d+)""").find(js)?.groupValues?.get(1)?.toIntOrNull()
+    }
+
+    /**
+     * Applies the `n` throttling transform carried in the player.js we already
+     * download for signature deciphering.
+     *
+     * The transform is a small function in `player.js` that mutates the `n`
+     * value in place. We extract its body and run the handful of array/string
+     * operations it performs. When player.js cannot be fetched, or its shape
+     * changed, null is returned and [NParameterTransformer] leaves the URL
+     * untouched — [StreamValidator] then decides whether that URL is usable,
+     * rather than the app breaking outright.
+     */
+    suspend fun transformNParameter(value: String): String? = withContext(Dispatchers.IO) {
+        if (value.isBlank()) return@withContext null
+        cachedNTransform?.let { return@withContext runTransform(it, value) }
+
+        val js = getPlayerJs()?.first ?: return@withContext null
+        val ops = extractThrottleOps(js)
+        if (ops == null || ops.isEmpty()) {
+            Log.d(TAG, "Could not locate the n-transform in player.js")
+            return@withContext null
+        }
+        cachedNTransform = ops
+        Log.d(TAG, "Extracted ${ops.size} throttling operations from player.js")
+        runTransform(ops, value)
+    }
+
+    /** A single step of the throttling function. */
+    private sealed interface ThrottleOp {
+        data object Reverse : ThrottleOp
+        data class Splice(val count: Int) : ThrottleOp
+        data class Slice(val count: Int) : ThrottleOp
+        data class Swap(val index: Int) : ThrottleOp
+        data class SetChar(val index: Int, val value: Char) : ThrottleOp
+        data class RemoveRange(val from: Int, val to: Int) : ThrottleOp
+    }
+
+    private fun runTransform(ops: List<ThrottleOp>, value: String): String? =
+        runCatching {
+            val chars = value.toMutableList()
+            for (op in ops) {
+                if (chars.isEmpty()) break
+                when (op) {
+                    is ThrottleOp.Reverse -> chars.reverse()
+                    is ThrottleOp.Splice -> repeat(op.count.coerceAtLeast(0)) {
+                        if (chars.isNotEmpty()) chars.removeAt(0)
+                    }
+                    is ThrottleOp.Slice -> {
+                        repeat(op.count.coerceAtLeast(0)) {
+                            if (chars.isNotEmpty()) chars.removeAt(0)
+                        }
+                    }
+                    is ThrottleOp.Swap -> {
+                        val i = op.index.mod(chars.size)
+                        val tmp = chars[0]
+                        chars[0] = chars[i]
+                        chars[i] = tmp
+                    }
+                    is ThrottleOp.SetChar ->
+                        if (op.index in chars.indices) chars[op.index] = op.value
+                    is ThrottleOp.RemoveRange -> {
+                        val from = op.from.coerceIn(0, chars.size - 1)
+                        val to = op.to.coerceIn(from, chars.size)
+                        for (i in from until to) chars.removeAt(i)
+                    }
+                }
+            }
+            chars.joinToString("")
+        }.getOrNull()
+
+    /**
+     * Locates the throttling function inside player.js and reduces its body to
+     * the operations it performs.
+     *
+     * The function is emitted in a stable shape: it takes one argument, works on
+     * a local array, and ends by calling `join("")`. We anchor on that and read
+     * the mutations in order.
+     */
+    private fun extractThrottleOps(js: String): List<ThrottleOp>? {
+        // The throttling helper is emitted as an indexed anonymous function,
+        // e.g. `NF=[function(a){...}]`. Anchor on the first such definition
+        // that contains a `join("")` terminator.
+        val anchor = Regex("""\[\s*function\s*\(\s*\w+\s*\)""").find(js) ?: return null
+
+        val bodyStart = anchor.range.last + 1
+        val body = js.substring(bodyStart, (bodyStart + 3000).coerceAtMost(js.length))
+        if (!body.contains("join")) return null
+
+        val ops = mutableListOf<ThrottleOp>()
+
+        // `a.reverse()`, `a.splice(1,2)`, `a.slice(1)` — the mutations the
+        // throttling function performs on its working array.
+        for (m in Regex("""\.\s*(reverse|splice|slice|join)\s*\(\s*([^)]*)\)""").findAll(body)) {
+            when (m.groupValues[1]) {
+                "reverse" -> ops.add(ThrottleOp.Reverse)
+                "join" -> Unit // terminator of the function, not a mutation
+                "splice" -> {
+                    val args = Regex("""\d+""").findAll(m.groupValues[2])
+                        .map { it.value.toInt() }.toList()
+                    ops.add(
+                        if (args.size >= 2) ThrottleOp.RemoveRange(args[0], args[1])
+                        else ThrottleOp.Splice(args.firstOrNull() ?: 1)
+                    )
+                }
+                "slice" -> {
+                    val n = Regex("""\d+""").find(m.groupValues[2])?.value?.toIntOrNull() ?: 1
+                    ops.add(ThrottleOp.Slice(n))
+                }
+            }
+        }
+
+        // `a[0] = a[3]` — the character swap that hides the throttle.
+        for (m in Regex("""\w+\s*\[\s*(\d+)\s*\]\s*=\s*\w+\s*\[\s*(\d+)\s*\]""").findAll(body)) {
+            val index = m.groupValues[1].toIntOrNull()
+            if (index != null) ops.add(ThrottleOp.Swap(index))
+        }
+
+        return ops.takeIf { it.isNotEmpty() }
     }
 
     private fun applyOps(sig: String, ops: List<DecipherOp>): String {

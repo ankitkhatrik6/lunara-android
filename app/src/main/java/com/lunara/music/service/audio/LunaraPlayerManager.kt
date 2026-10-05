@@ -65,6 +65,18 @@ object LunaraPlayerManager {
     // NOTE: cannot be a companion object — this is an `object`, not a class.
     private const val MAX_SONG_RETRIES = 3
 
+    /**
+     * How long the buffer may sit completely still before we treat the stream
+     * as dead. Must comfortably exceed a slow-but-working connection.
+     */
+    private const val STALL_TIMEOUT_MS = 15_000L
+
+    // Stall-watchdog state.
+    private var lastPosition = -1L
+    private var lastBuffered = -1L
+    private var lastProgressAt = 0L
+    private var stallRecovered = false
+
     fun init(context: Context) {
         serviceContext = context.applicationContext
         startService(context)
@@ -96,11 +108,10 @@ object LunaraPlayerManager {
         exoPlayer?.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
                 _isPlaying.value = playing
-                if (playing) {
-                    startPositionTracker()
-                } else {
-                    stopPositionTracker()
-                }
+                // The position/stall tracker is started when an item is prepared
+                // (see playMediaUri), NOT here: a stalled stream never reports
+                // isPlaying = true, so gating it on this callback would mean the
+                // one failure we most need to catch is the one we never watch.
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -161,8 +172,65 @@ object LunaraPlayerManager {
                     if (dur > 0L) {
                         _durationMs.value = dur
                     }
+                    watchForStall(player)
                 }
                 delay(400)
+            }
+        }
+    }
+
+    /**
+     * Stall watchdog.
+     *
+     * A truncated googlevideo URL lets ExoPlayer fill its buffer and then sit in
+     * `STATE_BUFFERING` indefinitely: no error, no progress, no end of stream.
+     * That is the exact failure this player was built to avoid, so we detect it
+     * ourselves — if neither the position nor the buffered position has moved
+     * for [STALL_TIMEOUT_MS] while buffering, the stream is treated as dead, the
+     * cached URL is dropped and the song is re-resolved against a different
+     * client instead of hanging.
+     */
+    private fun watchForStall(player: ExoPlayer) {
+        if (player.playbackState != Player.STATE_BUFFERING) {
+            lastPosition = -1L
+            lastBuffered = -1L
+            lastProgressAt = System.currentTimeMillis()
+            return
+        }
+
+        val position = player.currentPosition
+        val buffered = player.bufferedPosition
+        val now = System.currentTimeMillis()
+
+        if (position != lastPosition || buffered != lastBuffered) {
+            lastPosition = position
+            lastBuffered = buffered
+            lastProgressAt = now
+            return
+        }
+
+        // A brand-new buffer has not had time to fill yet; give it room. The
+        // progress check above already resets this window, so we only reach
+        // here when the buffer genuinely has not moved.
+        if (now - lastProgressAt < STALL_TIMEOUT_MS) return
+        if (stallRecovered) return
+
+        val song = _currentSong.value ?: return
+        stallRecovered = true
+        lastProgressAt = now
+        Log.w(TAG, "Playback stalled with no buffer progress for ${STALL_TIMEOUT_MS}ms; re-resolving ${song.id}")
+        _playbackError.value = "Stream stalled — reconnecting…"
+        StreamResolver.invalidate(song.id)
+        scope.launch {
+            val replacement = StreamResolver.resolveFresh(song.id)
+            if (replacement == null) {
+                _isBuffering.value = false
+                _playbackError.value = "Couldn't stream this song"
+                return@launch
+            }
+            StreamHeaders.register(replacement.url, replacement.headers)
+            withContext(Dispatchers.Main) {
+                playMediaUri(song, replacement.url, replacement.contentType)
             }
         }
     }
@@ -195,6 +263,12 @@ object LunaraPlayerManager {
         _playbackError.value = null
         _currentPositionMs.value = 0L
 
+        // Reset the stall watchdog for the new track.
+        lastPosition = -1L
+        lastBuffered = -1L
+        lastProgressAt = System.currentTimeMillis()
+        stallRecovered = false
+
         // Record history in local Room database
         serviceContext?.let { ctx ->
             scope.launch(Dispatchers.IO) {
@@ -205,39 +279,47 @@ object LunaraPlayerManager {
         }
 
         scope.launch {
-            var playableUrl: String? = null
-
-            // 1. Check local file
-            if (!song.localFilePath.isNullOrBlank()) {
-                val f = File(song.localFilePath)
-                if (f.exists() && f.length() > 0) {
-                    playableUrl = Uri.fromFile(f).toString()
-                }
+            // 1. A downloaded file on disk always wins.
+            val localFile = song.localFilePath
+                ?.takeIf { it.isNotBlank() }
+                ?.let { path -> File(path).takeIf { it.exists() && it.length() > 0 } }
+            if (localFile != null) {
+                withContext(Dispatchers.Main) { playMediaUri(song, Uri.fromFile(localFile).toString()) }
+                return@launch
             }
 
-            // 2. Check if already has stream URL or local URI
-            if (playableUrl == null && !song.streamUrl.isNullOrBlank()) {
-                playableUrl = song.streamUrl
+            // 2. Otherwise resolve a stream and prove it is playable.
+            //
+            //    Note: the persisted `song.streamUrl` is deliberately NOT reused.
+            //    For catalogue tracks it holds a googlevideo URL that expires
+            //    within hours; replaying it produced an endless "couldn't play"
+            //    loop because invalidating the resolver cache never touched the
+            //    copy stored in Room. Only a `content://` URI from the local
+            //    media scanner is a stable, reusable value.
+            val persisted = song.streamUrl?.takeIf { it.startsWith("content://") }
+            if (persisted != null) {
+                withContext(Dispatchers.Main) { playMediaUri(song, persisted) }
+                return@launch
             }
 
-            // 3. Resolve stream URL
-            if (playableUrl == null) {
-                playableUrl = StreamResolver.resolveStreamUrl(song.id)
-            }
-
-            if (playableUrl.isNullOrBlank()) {
+            val candidate = StreamResolver.resolve(song.id)
+            if (candidate == null) {
                 _isBuffering.value = false
                 _playbackError.value = "Couldn't stream this song"
                 return@launch
             }
 
+            // Bind the minting identity to this URL so the data source sends the
+            // matching User-Agent / Referer on every range request.
+            StreamHeaders.register(candidate.url, candidate.headers)
+
             withContext(Dispatchers.Main) {
-                playMediaUri(song, playableUrl)
+                playMediaUri(song, candidate.url, candidate.contentType)
             }
         }
     }
 
-    private fun playMediaUri(song: Song, mediaUri: String) {
+    private fun playMediaUri(song: Song, mediaUri: String, contentType: String? = null) {
         val player = exoPlayer
         if (player == null) {
             serviceContext?.let { startService(it) }
@@ -255,6 +337,7 @@ object LunaraPlayerManager {
         val mediaItem = MediaItem.Builder()
             .setUri(mediaUri)
             .setMediaId(song.id)
+            .setMimeType(contentType)
             .setMediaMetadata(metadata)
             .build()
 
@@ -262,6 +345,10 @@ object LunaraPlayerManager {
         player.prepare()
         player.playWhenReady = true
         _isPlaying.value = true
+
+        // Watch from the moment the item is prepared: a truncated stream will sit
+        // in STATE_BUFFERING forever without ever reaching isPlaying.
+        startPositionTracker()
     }
 
     fun togglePlayPause() {

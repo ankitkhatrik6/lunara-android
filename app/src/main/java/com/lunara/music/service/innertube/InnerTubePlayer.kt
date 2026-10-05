@@ -12,12 +12,14 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 /**
- * Minimal, self contained InnerTube player client.
+ * Self-contained InnerTube `/player` client.
  *
- * It requests the `/player` endpoint for a video id, reads the adaptive audio
- * formats and returns a directly playable URL. Only formats that already carry
- * a plain `url` are accepted, so no signature deobfuscation (JavaScript) is
- * required for the client identities used here.
+ * It asks for the player response of a video id under a given client identity
+ * and converts the returned audio formats into [StreamCandidate]s that carry
+ * the identity, headers and expiry the later media request will need.
+ *
+ * Formats that arrive ciphered are deciphered here instead of being discarded,
+ * which is what keeps the WEB-family clients usable as fallbacks.
  */
 object InnerTubePlayer {
     private const val TAG = "InnerTubePlayer"
@@ -35,7 +37,7 @@ object InnerTubePlayer {
 
     /** Fetch and cache the InnerTube visitor id, required by some clients. */
     suspend fun ensureVisitorData(): String? = withContext(Dispatchers.IO) {
-        visitorData?.let { return@withContext it }
+        visitorData?.takeIf { it.isNotBlank() }?.let { return@withContext it }
         for (host in listOf(InnerTubeClients.YOUTUBE_BASE, InnerTubeClients.MUSIC_BASE)) {
             runCatching {
                 val req = Request.Builder()
@@ -44,18 +46,21 @@ object InnerTubePlayer {
                     .build()
                 http.newCall(req).execute().use { resp ->
                     val body = resp.body?.string() ?: return@use
-                    val marker = "\"visitorData\":\""
-                    val start = body.indexOf(marker)
-                    if (start != -1) {
-                        val from = start + marker.length
-                        val end = body.indexOf('"', from)
-                        if (end > from) visitorData = body.substring(from, end)
-                    }
+                    extractVisitorData(body)?.let { visitorData = it }
                 }
             }.onFailure { Log.w(TAG, "visitorData fetch failed for $host: ${it.message}") }
             if (!visitorData.isNullOrBlank()) break
         }
         visitorData
+    }
+
+    private fun extractVisitorData(body: String): String? {
+        val marker = "\"visitorData\":\""
+        val start = body.indexOf(marker)
+        if (start == -1) return null
+        val from = start + marker.length
+        val end = body.indexOf('"', from)
+        return if (end > from) body.substring(from, end) else null
     }
 
     /**
@@ -67,29 +72,19 @@ object InnerTubePlayer {
         videoId: String,
         playlistId: String? = null,
     ): JSONObject? = withContext(Dispatchers.IO) {
-        val visitor = ensureVisitorData()
+        val visitor = YouTubeSession.visitorData ?: ensureVisitorData()
 
         val context = JSONObject().apply {
             put("client", client.toClientContext(visitor, hl = "en", gl = "US"))
-            if (client.isEmbedded) {
-                put(
-                    "thirdParty",
-                    JSONObject().put("embedUrl", "https://www.youtube.com/watch?v=$videoId")
-                )
-            }
         }
 
-        // Blazify: web-family requests carry playbackContext; sts (which
-        // player.js generation is asking) is quoted when the client needs it.
         val playbackContext = JSONObject().put(
             "contentPlaybackContext", JSONObject().apply {
                 put("html5Preference", "HTML5_PREF_WANTS")
                 put("signatureVoiceSearch", false)
             }
         )
-        if (client.useSignatureTimestamp) {
-            PlayerCipher.signatureTimestamp()?.let { playbackContext.put("signatureTimestamp", it) }
-        }
+
         val body = JSONObject().apply {
             put("context", context)
             put("videoId", videoId)
@@ -108,37 +103,34 @@ object InnerTubePlayer {
             .addHeader("X-Goog-Api-Key", client.apiKey)
             .addHeader("X-YouTube-Client-Name", client.clientId)
             .addHeader("X-YouTube-Client-Version", client.clientVersion)
-            .addHeader("X-Origin", client.origin)
+            .addHeader("Origin", client.origin)
             .addHeader("Referer", client.referer)
             .addHeader("User-Agent", client.userAgent)
             .apply { visitor?.let { addHeader("X-Goog-Visitor-Id", it) } }
             .apply { attachSession(this, client.origin) }
             .build()
 
-        postPlayer(url, req, client, videoId)
+        executePlayer(req, client, videoId)
     }
 
-    private suspend fun postPlayer(
-        url: String,
+    private suspend fun executePlayer(
         req: Request,
         client: InnerTubeClient,
         videoId: String,
     ): JSONObject? = withContext(Dispatchers.IO) {
-
         try {
             http.newCall(req).execute().use { r ->
                 if (!r.isSuccessful) {
-                    Log.w(TAG, "${client.clientName}: HTTP ${r.code} for $videoId")
-                    return@withContext alternateIfMusicHost(url, req, client, videoId, r.code)
+                    Log.d(TAG, "${client.clientName}: HTTP ${r.code} for $videoId")
+                    return@withContext null
                 }
                 val text = r.body?.string() ?: return@withContext null
                 val json = runCatching { JSONObject(text) }.getOrNull() ?: return@withContext null
-                val status = json.optJSONObject("playabilityStatus")?.optString("status")
+                val playability = json.optJSONObject("playabilityStatus")
+                val status = playability?.optString("status")
                 if (status != null && status != "OK") {
-                    Log.d(TAG, "${client.clientName}: playability=$status for $videoId")
-                    if (status == "LOGIN_REQUIRED" || status == "UNPLAYABLE" || status == "ERROR") {
-                        return@withContext alternateIfMusicHost(url, req, client, videoId, null)
-                    }
+                    Log.d(TAG, "${client.clientName}: playability=$status " +
+                        "(${playability?.optString("reason")}) for $videoId")
                     return@withContext null
                 }
                 InnerTubeSession.rememberFromResponse(json)
@@ -146,49 +138,6 @@ object InnerTubePlayer {
             }
         } catch (e: Exception) {
             Log.w(TAG, "${client.clientName}: request failed for $videoId: ${e.message}")
-            null
-        }
-    }
-
-    /**
-     * music.youtube.com rejects some third-party clients that work fine on
-     * www.youtube.com (seen as LOGIN_REQUIRED / HTTP errors). Retry once on the
-     * alternate host before the resolver falls through to the next client.
-     */
-    private suspend fun alternateIfMusicHost(
-        url: String,
-        req: Request,
-        client: InnerTubeClient,
-        videoId: String,
-        failedCode: Int?,
-    ): JSONObject? = withContext(Dispatchers.IO) {
-        val alternateBase = when {
-            url.startsWith(InnerTubeClients.MUSIC_BASE) -> InnerTubeClients.YOUTUBE_BASE
-            url.startsWith(InnerTubeClients.YOUTUBE_BASE) -> InnerTubeClients.MUSIC_BASE
-            else -> return@withContext null
-        }
-        val alternateUrl = url.replaceFirst(
-            if (alternateBase == InnerTubeClients.YOUTUBE_BASE) InnerTubeClients.MUSIC_BASE else InnerTubeClients.YOUTUBE_BASE,
-            alternateBase
-        )
-        try {
-            http.newCall(req.newBuilder().url(alternateUrl).build()).execute().use { r ->
-                if (!r.isSuccessful) {
-                    Log.w(TAG, "${client.clientName}: alternate host HTTP ${r.code} for $videoId")
-                    return@withContext null
-                }
-                val text = r.body?.string() ?: return@withContext null
-                val json = runCatching { JSONObject(text) }.getOrNull() ?: return@withContext null
-                val status = json.optJSONObject("playabilityStatus")?.optString("status")
-                if (status != "OK") {
-                    Log.d(TAG, "${client.clientName}: alternate host playability=$status for $videoId")
-                    return@withContext null
-                }
-                InnerTubeSession.rememberFromResponse(json)
-                json
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "${client.clientName}: alternate host failed for $videoId: ${e.message}")
             null
         }
     }
@@ -202,83 +151,72 @@ object InnerTubePlayer {
         }
     }
 
-    data class AudioCandidate(
-        val url: String,
-        val bitrate: Int,
-        val isAac: Boolean,
-        val isOriginal: Boolean,
-        val signatureCipher: String? = null,
-    )
-
-    fun collectAudioCandidates(playerResponse: JSONObject): List<AudioCandidate> {
+    /**
+     * Every audio format of [playerResponse], best first, as playable candidates
+     * bound to [client]'s identity.
+     *
+     * Direct URLs are used as-is; ciphered ones are deciphered through
+     * [PlayerCipher]. The `n` throttling parameter, when present, is run
+     * through [NParameterTransformer]. A format whose URL cannot be recovered is
+     * skipped rather than silently returned in a state that is guaranteed to
+     * fail at playback time.
+     */
+    suspend fun collectAudioCandidates(
+        playerResponse: JSONObject,
+        client: InnerTubeClient,
+        videoId: String,
+    ): List<StreamCandidate> {
         val streaming = playerResponse.optJSONObject("streamingData") ?: return emptyList()
 
-        val candidates = mutableListOf<JSONObject>()
-        streaming.optJSONArray("adaptiveFormats")?.let { addAll(it, candidates) }
-        streaming.optJSONArray("formats")?.let { addAll(it, candidates) }
+        val formats = mutableListOf<JSONObject>()
+        streaming.optJSONArray("adaptiveFormats")?.let { addAll(it, formats) }
+        streaming.optJSONArray("formats")?.let { addAll(it, formats) }
 
-        return candidates
+        val headers = client.mediaHeaders()
+        val expiresAt = System.currentTimeMillis() + DEFAULT_URL_LIFETIME_MS
+
+        return formats
             .filter { it.isAudioFormat() }
             .mapNotNull { format ->
-                // Direct URL first; otherwise keep the cipher for later
-                // deciphering (Blazify: signatureCipher -> deciphered URL).
-                val url = format.optString("url", "").takeIf { it.isNotBlank() }
-                if (url != null) {
-                    AudioCandidate(
-                        url = url,
-                        bitrate = format.optInt("bitrate", 0).let {
-                            if (it > 0) it else format.optInt("averageBitrate", 0)
-                        },
-                        isAac = format.optString("mimeType").contains("mp4a"),
-                        isOriginal = format.isOriginalAudio()
-                    )
-                } else {
-                    val cipher = format.optString("signatureCipher", "")
-                        .ifBlank { format.optString("cipher", "") }
-                        .takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                    AudioCandidate(
-                        url = "",
-                        bitrate = format.optInt("bitrate", 0).let {
-                            if (it > 0) it else format.optInt("averageBitrate", 0)
-                        },
-                        isAac = format.optString("mimeType").contains("mp4a"),
-                        isOriginal = format.isOriginalAudio(),
-                        signatureCipher = cipher
-                    )
+                val bitrate = format.optInt("bitrate", 0).let {
+                    if (it > 0) it else format.optInt("averageBitrate", 0)
                 }
+                val mimeType = format.optString("mimeType", "")
+                val contentLength = format.optString("contentLength", "").toLongOrNull() ?: 0L
+
+                val rawUrl = format.optString("url", "").takeIf { it.isNotBlank() }
+                    ?: run {
+                        val cipher = format.optString("signatureCipher", "")
+                            .ifBlank { format.optString("cipher", "") }
+                        if (cipher.isBlank()) return@mapNotNull null
+                        PlayerCipher.decipherSignatureCipher(cipher)
+                    }
+                    ?: return@mapNotNull null
+
+                // Fix the throttling parameter before the URL is ever requested.
+                val fixed = NParameterTransformer.apply(rawUrl) { value ->
+                    PlayerCipher.transformNParameter(value)
+                }
+                if (fixed != rawUrl) {
+                    Log.d(TAG, "Rewrote throttling parameter for $videoId")
+                }
+
+                StreamCandidate(
+                    url = fixed,
+                    mimeType = mimeType,
+                    bitrate = bitrate,
+                    contentLength = contentLength,
+                    clientName = client.clientName,
+                    headers = headers,
+                    expiresAtMs = StreamCandidate.expiryFromUrl(fixed)
+                        .takeIf { it > 0 } ?: expiresAt,
+                    source = "innertube",
+                ).withSafeLifetime()
             }
             .sortedWith(
-                compareByDescending<AudioCandidate> { it.isOriginal }
+                compareByDescending<StreamCandidate> { it.contentType == "audio/mp4" }
                     .thenByDescending { it.bitrate }
-                    .thenByDescending { if (it.isAac) 1 else 0 }
             )
-    }
-
-    /**
-     * Picks the best directly playable audio URL from a player response.
-     * Returns null when no audio format carries a plain URL (those would need
-     * signature deobfuscation, which the chosen client identities avoid).
-     */
-    fun selectAudioUrl(playerResponse: JSONObject): String? {
-        val candidates = collectAudioCandidates(playerResponse)
-        val best = candidates.firstOrNull() ?: return null
-        return best.url.takeIf { it.isNotBlank() }
-    }
-
-    suspend fun resolveBestUrl(
-        playerResponse: JSONObject,
-        validate: suspend (String) -> Boolean = { validateUrl(it) },
-    ): String? {
-        for (candidate in collectAudioCandidates(playerResponse)) {
-            if (candidate.url.isNotBlank()) {
-                if (validate(candidate.url)) return candidate.url
-                continue
-            }
-            val cipher = candidate.signatureCipher ?: continue
-            val deciphered = runCatching { PlayerCipher.decipherSignatureCipher(cipher) }.getOrNull()
-            if (!deciphered.isNullOrBlank() && validate(deciphered)) return deciphered
-        }
-        return null
     }
 
     private fun addAll(array: JSONArray, into: MutableList<JSONObject>) {
@@ -293,20 +231,6 @@ object InnerTubePlayer {
         return optString("mimeType", "").startsWith("audio/")
     }
 
-    private fun JSONObject.isOriginalAudio(): Boolean {
-        val track = optJSONObject("audioTrack") ?: return true
-        return !track.optBoolean("isAutoDubbed", false)
-    }
-
-    /** Confirms the URL actually serves audio (some URLs 403 on first play). */
-    fun validateUrl(url: String): Boolean = runCatching {
-        val req = Request.Builder()
-            .url(url)
-            .header("Range", "bytes=0-1")
-            .addHeader("User-Agent", InnerTubeClients.USER_AGENT_WEB)
-            .build()
-        http.newCall(req).execute().use { r ->
-            r.code == 200 || r.code == 206
-        }
-    }.getOrDefault(false)
+    /** Fallback lifetime for responses that omit the `expire` parameter. */
+    private const val DEFAULT_URL_LIFETIME_MS = 5 * 60 * 60 * 1000L
 }

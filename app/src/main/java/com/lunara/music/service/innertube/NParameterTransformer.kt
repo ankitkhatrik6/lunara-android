@@ -42,6 +42,8 @@ object NParameterTransformer {
         if (transformed == n) return url
 
         Log.d(TAG, "Applied throttling transform to the n parameter")
-        return url.replace(Regex("([?&]n=)[^&]*") { m -> m.groupValues[1] + transformed })
+        return url.replace(Regex("([?&]n=)[^&]*")) { match ->
+            match.groupValues[1] + transformed
+        }
     }
 }

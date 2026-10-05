@@ -50,7 +50,8 @@ class LunaraMediaSessionService : MediaSessionService() {
             .retryOnConnectionFailure(true)
             .build()
 
-        val upstreamFactory = OkHttpDataSource.Factory(httpClient).setAllowCrossProtocolRedirects(true)
+        // Redirects are handled by the shared OkHttp client below.
+        val upstreamFactory = OkHttpDataSource.Factory(httpClient)
         val headerAware = HeaderAwareDataSource.Factory(upstreamFactory)
 
         // Wrap with DefaultDataSource so local (file:// and content://) tracks

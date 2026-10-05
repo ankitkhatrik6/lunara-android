@@ -158,13 +158,13 @@ object PlayerCipher {
     }
 
     private fun parseHelperObject(js: String, callerBody: String): List<DecipherOp>? {
-        val objName = Regex("""([a-zA-Z0-9$_]+)\.[a-zA-Z0-9$_]+\s*\(\s*[a-zA-Z]+\s*(?:,\s*\d+)?\s*\)""")
+        val objName = Regex("""([a-zA-Z0-9_$]+)\.[a-zA-Z0-9_$]+\s*\(\s*[a-zA-Z]+\s*(?:,\s*\d+)?\s*\)""")
             .find(callerBody)?.groupValues?.get(1) ?: return null
         val objDef = Regex("""var\s+${Regex.escape(objName)}\s*=\s*\{(.{0,3000}?)\};""")
             .find(js)?.groupValues?.get(1) ?: return null
         val methodOp = mutableMapOf<String, DecipherOp>()
         for (entry in objDef.split("},")) {
-            val name = Regex("""([a-zA-Z0-9$_]+)\s*:\s*function""").find(entry)?.groupValues?.get(1) ?: continue
+            val name = Regex("""([a-zA-Z0-9_$]+)\s*:\s*function""").find(entry)?.groupValues?.get(1) ?: continue
             val op: DecipherOp = when {
                 entry.contains(".reverse(") -> DecipherOp.Reverse
                 entry.contains(".splice(") -> DecipherOp.Splice(1)
@@ -175,7 +175,7 @@ object PlayerCipher {
             methodOp[name] = op
         }
         val ops = mutableListOf<DecipherOp>()
-        val callRegex = Regex("""${Regex.escape(objName)}\.([a-zA-Z0-9$_]+)\s*\(\s*[a-zA-Z]+\s*(?:,\s*(\d+))?\s*\)""")
+        val callRegex = Regex("""${Regex.escape(objName)}\.([a-zA-Z0-9_$]+)\s*\(\s*[a-zA-Z]+\s*(?:,\s*(\d+))?\s*\)""")
         for (m in callRegex.findAll(callerBody)) {
             val base = methodOp[m.groupValues[1]] ?: continue
             val n = m.groupValues[2].toIntOrNull()

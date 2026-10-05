@@ -115,7 +115,7 @@ object InnerTubePlayer {
             .apply { attachSession(this, client.origin) }
             .build()
 
-        return postPlayer(url, req, client, videoId)
+        postPlayer(url, req, client, videoId)
     }
 
     private suspend fun postPlayer(

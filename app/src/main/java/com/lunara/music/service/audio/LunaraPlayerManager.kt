@@ -62,9 +62,8 @@ object LunaraPlayerManager {
 
     private var songRetryCount = 0
 
-    private companion object {
-        const val MAX_SONG_RETRIES = 3
-    }
+    // NOTE: cannot be a companion object — this is an `object`, not a class.
+    private const val MAX_SONG_RETRIES = 3
 
     fun init(context: Context) {
         serviceContext = context.applicationContext

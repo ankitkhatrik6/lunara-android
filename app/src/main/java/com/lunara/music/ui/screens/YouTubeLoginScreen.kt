@@ -110,8 +110,10 @@ fun YouTubeLoginScreen(
                         isChecking = true
                         message = "Checking session..."
                         val result = withContext(Dispatchers.IO) { YouTubeMusicLogin.captureSession() }
-                        if (result != null) {
-                            YouTubeSession.signIn(result)
+                        val cookie = result?.cookie
+                        if (!cookie.isNullOrBlank()) {
+                            YouTubeSession.signIn(cookie)
+                            result?.accountLabel?.let { YouTubeSession.setAccountLabel(it) }
                             val label = withContext(Dispatchers.IO) { YouTubeSession.describeAccount() }
                             message = if (!label.isNullOrBlank()) "Signed in as $label" else "Signed in"
                             isChecking = false

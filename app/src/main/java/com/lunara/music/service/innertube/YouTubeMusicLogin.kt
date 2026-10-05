@@ -194,8 +194,7 @@ object YouTubeAccountClient {
                 JSONObject().put("context", clientContext())
             ) ?: return@withContext null
 
-            val header = json.optJSONObject("actions")
-                ?.optJSONArray(0)
+            val header = json.optJSONArray("actions")
                 ?.optJSONObject(0)
                 ?.optJSONObject("openPopupAction")
                 ?.optJSONObject("popup")

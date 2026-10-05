@@ -5,8 +5,8 @@ package com.lunara.music.service.innertube
  * obtain playable audio streams.
  *
  * These are the same public client identities the Blazify project relies on.
- * Clients that return direct audio URLs (no signature cipher and no PoToken)
- * are tried first, which keeps playback working without a JavaScript engine.
+ * Each client talks to the API base and origin matching its own family, exactly
+ * as Blazify's InnerTube client does.
  */
 data class InnerTubeClient(
     val clientName: String,
@@ -14,6 +14,9 @@ data class InnerTubeClient(
     val clientId: String,
     val userAgent: String,
     val apiKey: String,
+    val baseUrl: String,
+    val origin: String,
+    val referer: String,
     val osName: String? = null,
     val osVersion: String? = null,
     val deviceMake: String? = null,
@@ -42,6 +45,9 @@ object InnerTubeClients {
     const val USER_AGENT_WEB =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0"
 
+    const val MUSIC_BASE = "https://music.youtube.com"
+    const val YOUTUBE_BASE = "https://www.youtube.com"
+
     // Public API keys, one per client family.
     const val KEY_ANDROID = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w"
     const val KEY_IOS = "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc"
@@ -52,11 +58,24 @@ object InnerTubeClients {
     const val WARMUP_VIDEO_ID = "dQw4w9WgXcQ"
 
     /**
-     * Tried in order. The first four return direct (non-ciphered) audio URLs on
-     * the current catalogue, so they need no JavaScript deobfuscation. WEB_REMIX
-     * is kept last as a best effort fallback.
+     * Tried in order. Verified against the live catalogue: IOS returns direct
+     * (non-ciphered) audio URLs that validate with HTTP 206, so it leads and
+     * playback starts without any JavaScript deobfuscation. The remaining
+     * clients are kept as fallbacks; WEB_REMIX is last as a best effort.
      */
     val STREAM_CLIENTS: List<InnerTubeClient> = listOf(
+        InnerTubeClient(
+            clientName = "IOS",
+            clientVersion = "21.03.1",
+            clientId = "5",
+            userAgent = "com.google.ios.youtube/21.03.1 (iPhone16,2; U; CPU iOS 18_2 like Mac OS X;)",
+            apiKey = KEY_IOS,
+            baseUrl = YOUTUBE_BASE,
+            origin = YOUTUBE_BASE,
+            referer = "$YOUTUBE_BASE/",
+            osName = "iOS",
+            osVersion = "18.2.22C152",
+        ),
         InnerTubeClient(
             clientName = "ANDROID_VR",
             clientVersion = "1.43.32",
@@ -64,6 +83,9 @@ object InnerTubeClients {
             userAgent = "com.google.android.apps.youtube.vr.oculus/1.43.32 " +
                 "(Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/107.0.5284.2)",
             apiKey = KEY_ANDROID,
+            baseUrl = YOUTUBE_BASE,
+            origin = YOUTUBE_BASE,
+            referer = "$YOUTUBE_BASE/",
             osName = "Android",
             osVersion = "12",
             deviceMake = "Oculus",
@@ -72,21 +94,15 @@ object InnerTubeClients {
             buildId = "SQ3A.220605.009.A1",
         ),
         InnerTubeClient(
-            clientName = "IOS",
-            clientVersion = "21.03.1",
-            clientId = "5",
-            userAgent = "com.google.ios.youtube/21.03.1 (iPhone16,2; U; CPU iOS 18_2 like Mac OS X;)",
-            apiKey = KEY_IOS,
-            osName = "iOS",
-            osVersion = "18.2.22C152",
-        ),
-        InnerTubeClient(
             clientName = "ANDROID_CREATOR",
             clientVersion = "25.03.101",
             clientId = "14",
             userAgent = "com.google.android.apps.youtube.creator/25.03.101 " +
                 "(Linux; U; Android 15; en_US; Pixel 9 Pro Fold; Build/AP3A.241005.015.A2; Cronet/132.0.6779.0)",
             apiKey = KEY_ANDROID,
+            baseUrl = YOUTUBE_BASE,
+            origin = YOUTUBE_BASE,
+            referer = "$YOUTUBE_BASE/",
             osName = "Android",
             osVersion = "15",
             deviceMake = "Google",
@@ -101,6 +117,9 @@ object InnerTubeClients {
             userAgent = "Mozilla/5.0 (PlayStation; PlayStation 4/12.02) AppleWebKit/605.1.15 " +
                 "(KHTML, like Gecko) Version/15.4 Safari/605.1.15",
             apiKey = KEY_WEB,
+            baseUrl = YOUTUBE_BASE,
+            origin = YOUTUBE_BASE,
+            referer = "$YOUTUBE_BASE/",
             isEmbedded = true,
         ),
         InnerTubeClient(
@@ -109,6 +128,9 @@ object InnerTubeClients {
             clientId = "67",
             userAgent = USER_AGENT_WEB,
             apiKey = KEY_WEB_REMIX,
+            baseUrl = MUSIC_BASE,
+            origin = MUSIC_BASE,
+            referer = "$MUSIC_BASE/",
         ),
     )
 }

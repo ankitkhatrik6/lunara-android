@@ -1,6 +1,5 @@
 package com.lunara.music.service.lyrics
 
-import android.content.Context
 import com.lunara.music.data.models.LyricsData
 
 /**
@@ -12,7 +11,7 @@ import com.lunara.music.data.models.LyricsData
 object LyricsService {
 
     /** Call once at application start (enables the WebView based Better Lyrics provider). */
-    fun init(context: Context) {
+    fun init(context: android.content.Context) {
         BetterLyricsLyricsProvider.init(context)
     }
 
@@ -33,12 +32,40 @@ object LyricsService {
 
         val lrc = result.first
         val lines = LyricsUtils.parseLrc(lrc)
+        if (lines.isNotEmpty()) {
+            val plainFallback = lrc.lines()
+                .map { it.trim() }
+                .filter { it.isNotBlank() && !it.startsWith("[") && !it.startsWith("<") && !it.startsWith("{") }
+                .joinToString("\n")
+                .ifBlank { null }
+            return LyricsData(
+                songTitle = title,
+                artist = artist,
+                plainLyrics = plainFallback,
+                lines = lines,
+                isSynced = true
+            )
+        }
+
+        val plain = lrc.lines()
+            .map {
+                it.trim()
+                    .replace(Regex("""^\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]"""), "")
+                    .replace(Regex("""<[^>\n]*>"""), "")
+                    .replace(Regex("""\{(?:agent:[^}]+|bg)\}"""), "")
+                    .trim()
+            }
+            .filter { it.isNotBlank() && it != "[null]" && it != "null" }
+            .joinToString("\n")
+            .ifBlank { null }
+            ?: return null
+
         return LyricsData(
             songTitle = title,
             artist = artist,
-            plainLyrics = if (lines.isEmpty()) lrc else null,
-            lines = lines,
-            isSynced = lines.isNotEmpty()
+            plainLyrics = plain,
+            lines = emptyList(),
+            isSynced = false
         )
     }
 }

@@ -38,6 +38,7 @@ sealed class Screen(val route: String) {
     object Downloaded : Screen("downloaded")
     object LocalMusic : Screen("local_music")
     object Settings : Screen("settings")
+    object YouTubeLogin : Screen("youtube_login")
     object PlaylistDetail : Screen("playlist_detail/{playlistId}") {
         fun createRoute(playlistId: String) = "playlist_detail/$playlistId"
     }
@@ -152,7 +153,15 @@ fun LunaraNavHost(modifier: Modifier = Modifier) {
 
             composable(Screen.Settings.route) {
                 SettingsScreen(
-                    onNavigateBack = { navController.popBackStack() }
+                    onNavigateBack = { navController.popBackStack() },
+                    onNavigateToYouTubeLogin = { navController.navigate(Screen.YouTubeLogin.route) }
+                )
+            }
+
+            composable(Screen.YouTubeLogin.route) {
+                YouTubeLoginScreen(
+                    onNavigateBack = { navController.popBackStack() },
+                    onSignedIn = { navController.popBackStack() }
                 )
             }
 

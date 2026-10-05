@@ -34,6 +34,7 @@ import kotlinx.coroutines.withContext
 @Composable
 fun SettingsScreen(
     onNavigateBack: () -> Unit,
+    onNavigateToYouTubeLogin: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -51,6 +52,8 @@ fun SettingsScreen(
 
     var showEditNameDialog by remember { mutableStateOf(false) }
     var newNameText by remember { mutableStateOf("") }
+    val ytAccountLabel by com.lunara.music.service.innertube.YouTubeSession.accountLabel.collectAsState()
+    val ytCookie by com.lunara.music.service.innertube.YouTubeSession.cookie.collectAsState()
     var showQualityDialog by remember { mutableStateOf(false) }
     var showLicensesDialog by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
@@ -102,6 +105,31 @@ fun SettingsScreen(
                         showEditNameDialog = true
                     }
                 )
+            }
+            item {
+                SettingsItem(
+                    icon = Icons.Outlined.AccountCircle,
+                    title = "YouTube Music Account",
+                    subtitle = if (ytCookie.isNullOrBlank()) {
+                        "Not signed in — sign in to unlock your library"
+                    } else {
+                        ytAccountLabel ?: "Signed in"
+                    },
+                    onClick = onNavigateToYouTubeLogin
+                )
+            }
+            if (!ytCookie.isNullOrBlank()) {
+                item {
+                    SettingsItem(
+                        icon = Icons.Outlined.ExitToApp,
+                        title = "Sign out of YouTube Music",
+                        subtitle = "Disconnect this account from Lunara",
+                        onClick = {
+                            com.lunara.music.service.innertube.YouTubeSession.signOut()
+                            Toast.makeText(context, "Signed out of YouTube Music", Toast.LENGTH_SHORT).show()
+                        }
+                    )
+                }
             }
 
             // Playback Section

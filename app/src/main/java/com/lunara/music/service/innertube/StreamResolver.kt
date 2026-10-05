@@ -48,16 +48,24 @@ object StreamResolver {
         if (videoId.isBlank()) return@withContext null
         cached(videoId)?.let { return@withContext it }
 
-        // 1. InnerTube player. Clients that return direct audio URLs are tried first.
+        // 0. Fresh anonymous identity first. A stale experimental visitor id is
+        //    the most common reason the catalogue returns LOGIN_REQUIRED for
+        //    every play, so always prefer the one shipped with the response.
+        InnerTubeSession.refreshVisitorData(this)
+
+        // 1. InnerTube player. Direct URLs win; ciphered formats are
+        //    deciphered via player.js ops (Blazify path); every candidate is
+        //    validated with a ranged request before acceptance.
         for (client in InnerTubeClients.STREAM_CLIENTS) {
             val response = runCatching { InnerTubePlayer.fetchPlayerResponse(client, videoId) }
                 .getOrNull() ?: continue
-            val url = InnerTubePlayer.selectAudioUrl(response)
-            if (!url.isNullOrBlank() && InnerTubePlayer.validateUrl(url)) {
+            val url = runCatching { InnerTubePlayer.resolveBestUrl(response) }.getOrNull()
+            if (!url.isNullOrBlank()) {
                 Log.d(TAG, "Resolved $videoId via ${client.clientName}")
                 store(videoId, url)
                 return@withContext url
             }
+            Log.d(TAG, "No playable candidate for $videoId via ${client.clientName}")
         }
 
         // 2. Public mirrors as a safety net.
@@ -78,10 +86,14 @@ object StreamResolver {
     }
 
     private fun resolveViaMirrors(videoId: String): String? {
+        // Blazify secondary fallbacks: Piped (current hosts) + YouTube
+        // transcript-timed embeds are lyrics-only; for audio use Piped and
+        // the cobalt API before giving up.
         val instances = listOf(
-            "https://pipedapi.kavin.rocks/streams/$videoId",
+            "https://pipedapi.reallyaweso.me/streams/$videoId",
             "https://pipedapi.adminforge.de/streams/$videoId",
-            "https://api.piped.private.coffee/streams/$videoId",
+            "https://pipedapi.leptons.xyz/streams/$videoId",
+            "https://pipedapi.r4fo.com/streams/$videoId",
             "https://inv.nadeko.net/api/v1/videos/$videoId",
             "https://invidious.nerdvpn.de/api/v1/videos/$videoId"
         )

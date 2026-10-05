@@ -22,6 +22,7 @@ object LyricsRepository {
         BetterLyricsLyricsProvider,
         KuGouLyricsProvider,
         LyricsPlusLyricsProvider,
+        YouTubeSubtitleLyricsProvider,
     )
 
     val providerNames: List<String> get() = providers.map { it.name }
@@ -81,9 +82,12 @@ object LyricsRepository {
     private fun isPlausible(lyrics: String, durationSeconds: Int): Boolean {
         if (durationSeconds <= 0) return true
         val entries = LyricsUtils.parseLrc(lyrics)
-        if (entries.isEmpty()) return true
+        // Plain lyrics cannot be time-verified — accept (Blazify does the same;
+        // rejecting here is what surfaced as "null" for Bollywood tracks).
+        if (entries.isEmpty()) return lyrics.trim().length >= 20
         val lastMs = entries.maxOf { it.timeMs }
         val durationMs = durationSeconds * 1000L
-        return lastMs >= (durationMs * 0.4).toLong() && lastMs <= durationMs + 15_000L
+        // Loose window: covers short clips, long mixes and off-by-minute metadata.
+        return lastMs >= (durationMs * 0.25).toLong() && lastMs <= durationMs + 120_000L
     }
 }

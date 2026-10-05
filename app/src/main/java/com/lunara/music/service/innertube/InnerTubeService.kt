@@ -47,10 +47,23 @@ object InnerTubeService {
                     .header("X-YouTube-Client-Version", CLIENT_VERSION)
                     .header("Origin", ORIGIN)
                     .header("Referer", REFERER)
+                attachSession(builder)
             }
             chain.proceed(builder.build())
         }
         .build()
+
+    private fun attachSession(builder: okhttp3.Request.Builder) {
+        YouTubeSession.cookie.value?.let { cookie ->
+            builder.header("Cookie", cookie)
+            YouTubeSession.authorizationHeader(ORIGIN)?.let { auth ->
+                builder.header("Authorization", auth)
+            }
+        }
+        YouTubeSession.visitorData?.takeIf { it.isNotBlank() }?.let { visitor ->
+            builder.header("X-Goog-Visitor-Id", visitor)
+        }
+    }
 
     private fun getClientContext(): JSONObject {
         return JSONObject().apply {
@@ -476,9 +489,18 @@ object InnerTubeService {
 
     suspend fun getPlaylist(browseId: String): Playlist? = withContext(Dispatchers.IO) {
         try {
+            // Blazify parity: browse ids arrive as PL/VL/RDAMPL. The browse
+            // endpoint wants the VL form for plain playlists, but radio/mix ids
+            // must pass through untouched.
+            val idParam = when {
+                browseId.startsWith("VL") || browseId.startsWith("MP") ||
+                    browseId.startsWith("RD") || browseId.startsWith("OLAK5uy_") -> browseId
+                browseId.startsWith("PL") -> "VL" + browseId.substring(2)
+                else -> browseId
+            }
             val reqBody = JSONObject().apply {
                 put("context", getClientContext())
-                put("browseId", browseId)
+                put("browseId", idParam)
             }
 
             val req = Request.Builder()
@@ -498,25 +520,63 @@ object InnerTubeService {
                 val desc = extractRunsText(header?.optJSONObject("description"))
                 val thumb = extractThumbnail(header?.optJSONObject("thumbnail"))
 
-                val tracks = mutableListOf<Song>()
-                val sectionList = json.optJSONObject("contents")
-                    ?.optJSONObject("singleColumnBrowseResultsRenderer")
+                val tabs = json.optJSONObject("contents")
+                    ?.optJSONObject("twoColumnBrowseResultsRenderer")
                     ?.optJSONArray("tabs")
-                    ?.optJSONObject(0)
-                    ?.optJSONObject("tabRenderer")
-                    ?.optJSONObject("content")
-                    ?.optJSONObject("sectionListRenderer")
-                    ?.optJSONArray("contents") ?: JSONArray()
+                    ?: json.optJSONObject("contents")
+                        ?.optJSONObject("singleColumnBrowseResultsRenderer")
+                        ?.optJSONArray("tabs") ?: JSONArray()
 
-                for (s in 0 until sectionList.length()) {
-                    val shelf = sectionList.optJSONObject(s)?.optJSONObject("musicPlaylistShelfRenderer") ?: continue
-                    val contents = shelf.optJSONArray("contents") ?: continue
-                    for (i in 0 until contents.length()) {
-                        val item = contents.optJSONObject(i)?.optJSONObject("musicResponsiveListItemRenderer") ?: continue
-                        val songsTemp = mutableListOf<Song>()
-                        parseListItem(item, songsTemp, mutableListOf(), mutableListOf(), mutableListOf())
-                        tracks.addAll(songsTemp)
+                val tracks = mutableListOf<Song>()
+                val continuations = mutableListOf<String>()
+                for (t in 0 until tabs.length()) {
+                    val sectionList = tabs.optJSONObject(t)
+                        ?.optJSONObject("tabRenderer")
+                        ?.optJSONObject("content")
+                        ?.optJSONObject("sectionListRenderer")
+                        ?.optJSONArray("contents") ?: continue
+
+                    for (s in 0 until sectionList.length()) {
+                        val sec = sectionList.optJSONObject(s) ?: continue
+                        val shelf = sec.optJSONObject("musicPlaylistShelfRenderer")
+                            ?: sec.optJSONObject("musicShelfRenderer")
+                        if (shelf == null) {
+                            val carousel = sec.optJSONObject("musicCarouselShelfRenderer")
+                            if (carousel != null) {
+                                val contents = carousel.optJSONArray("contents") ?: JSONArray()
+                                for (i in 0 until contents.length()) {
+                                    val twoRow = contents.optJSONObject(i)
+                                        ?.optJSONObject("musicTwoRowItemRenderer") ?: continue
+                                    val st = extractRunsText(twoRow.optJSONObject("title"))
+                                    val sa = extractRunsText(twoRow.optJSONObject("subtitle"))
+                                    val sh = extractThumbnail(twoRow.optJSONObject("thumbnailRenderer"))
+                                    val vid = twoRow.optJSONObject("navigationEndpoint")
+                                        ?.optJSONObject("watchEndpoint")?.optString("videoId").orEmpty()
+                                    if (vid.isNotBlank()) {
+                                        tracks.add(Song(id = vid, title = st, artist = sa, thumbnailUrl = sh))
+                                    }
+                                }
+                            }
+                            continue
+                        }
+                        shelf.optJSONArray("continuations")?.optJSONObject(0)
+                            ?.optJSONObject("nextContinuationData")?.optString("continuation")
+                            ?.takeIf { it.isNotBlank() }?.let { continuations.add(it) }
+                        val contents = shelf.optJSONArray("contents") ?: continue
+                        for (i in 0 until contents.length()) {
+                            val item = contents.optJSONObject(i)?.optJSONObject("musicResponsiveListItemRenderer") ?: continue
+                            val songsTemp = mutableListOf<Song>()
+                            parseListItem(item, songsTemp, mutableListOf(), mutableListOf(), mutableListOf())
+                            tracks.addAll(songsTemp)
+                        }
                     }
+                }
+
+                // Page long playlists via continuations (up to ~500 tracks).
+                var depth = 0
+                while (depth < 5 && continuations.isNotEmpty() && tracks.size < 500) {
+                    tracks.addAll(getPlaylistContinuation(continuations.removeAt(0)))
+                    depth += 1
                 }
 
                 return@withContext Playlist(
@@ -532,6 +592,57 @@ object InnerTubeService {
             Log.e(TAG, "getPlaylist failed: ${e.message}", e)
         }
         null
+    }
+
+    suspend fun getPlaylistContinuation(continuation: String): List<Song> = withContext(Dispatchers.IO) {
+        try {
+            val reqBody = JSONObject().apply {
+                put("context", getClientContext())
+                put("continuation", continuation)
+            }
+
+            val req = Request.Builder()
+                .url("$BASE_URL/browse")
+                .post(reqBody.toString().toRequestBody(JSON_MEDIA))
+                .addHeader("User-Agent", "Mozilla/5.0")
+                .build()
+
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext emptyList()
+                val body = resp.body?.string() ?: return@withContext emptyList()
+                val json = JSONObject(body)
+
+                val tracks = mutableListOf<Song>()
+                // Continuations arrive as sectionListContinuation or
+                // musicPlaylistShelfContinuation depending on the shelf.
+                val shelves = mutableListOf<JSONObject>()
+                json.optJSONObject("continuationContents")
+                    ?.optJSONObject("musicPlaylistShelfContinuation")?.let { shelves.add(it) }
+                json.optJSONObject("contents")
+                    ?.optJSONObject("sectionListContinuation")
+                    ?.optJSONArray("contents")?.let { sectionList ->
+                        for (s in 0 until sectionList.length()) {
+                            sectionList.optJSONObject(s)
+                                ?.optJSONObject("musicPlaylistShelfRenderer")?.let { shelves.add(it) }
+                        }
+                    }
+
+                for (shelf in shelves) {
+                    val contents = shelf.optJSONArray("contents") ?: continue
+                    for (i in 0 until contents.length()) {
+                        val item = contents.optJSONObject(i)?.optJSONObject("musicResponsiveListItemRenderer") ?: continue
+                        val songsTemp = mutableListOf<Song>()
+                        parseListItem(item, songsTemp, mutableListOf(), mutableListOf(), mutableListOf())
+                        tracks.addAll(songsTemp)
+                    }
+                }
+
+                return@withContext tracks
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "getPlaylistContinuation failed: ${e.message}", e)
+        }
+        emptyList()
     }
 
     suspend fun getArtist(browseId: String): Artist? = withContext(Dispatchers.IO) {

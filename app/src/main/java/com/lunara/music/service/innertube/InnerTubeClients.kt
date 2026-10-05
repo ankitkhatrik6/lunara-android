@@ -24,6 +24,7 @@ data class InnerTubeClient(
     val androidSdkVersion: String? = null,
     val buildId: String? = null,
     val isEmbedded: Boolean = false,
+    val useSignatureTimestamp: Boolean = false,
 ) {
     fun toClientContext(visitorData: String?, hl: String, gl: String): org.json.JSONObject =
         org.json.JSONObject().apply {
@@ -131,6 +132,7 @@ object InnerTubeClients {
             baseUrl = MUSIC_BASE,
             origin = MUSIC_BASE,
             referer = "$MUSIC_BASE/",
+            useSignatureTimestamp = true,
         ),
     )
 }

@@ -65,6 +65,7 @@ object InnerTubePlayer {
     suspend fun fetchPlayerResponse(
         client: InnerTubeClient,
         videoId: String,
+        playlistId: String? = null,
     ): JSONObject? = withContext(Dispatchers.IO) {
         val visitor = ensureVisitorData()
 
@@ -78,11 +79,24 @@ object InnerTubePlayer {
             }
         }
 
+        // Blazify: web-family requests carry playbackContext; sts (which
+        // player.js generation is asking) is quoted when the client needs it.
+        val playbackContext = JSONObject().put(
+            "contentPlaybackContext", JSONObject().apply {
+                put("html5Preference", "HTML5_PREF_WANTS")
+                put("signatureVoiceSearch", false)
+            }
+        )
+        if (client.useSignatureTimestamp) {
+            PlayerCipher.signatureTimestamp()?.let { playbackContext.put("signatureTimestamp", it) }
+        }
         val body = JSONObject().apply {
             put("context", context)
             put("videoId", videoId)
+            if (!playlistId.isNullOrBlank()) put("playlistId", playlistId)
             put("contentCheckOk", true)
             put("racyCheckOk", true)
+            put("playbackContext", playbackContext)
         }
 
         val url = "${client.baseUrl}/youtubei/v1/player?key=${client.apiKey}&prettyPrint=false"
@@ -98,21 +112,36 @@ object InnerTubePlayer {
             .addHeader("Referer", client.referer)
             .addHeader("User-Agent", client.userAgent)
             .apply { visitor?.let { addHeader("X-Goog-Visitor-Id", it) } }
+            .apply { attachSession(this, client.origin) }
             .build()
+
+        return postPlayer(url, req, client, videoId)
+    }
+
+    private suspend fun postPlayer(
+        url: String,
+        req: Request,
+        client: InnerTubeClient,
+        videoId: String,
+    ): JSONObject? = withContext(Dispatchers.IO) {
 
         try {
             http.newCall(req).execute().use { r ->
                 if (!r.isSuccessful) {
                     Log.w(TAG, "${client.clientName}: HTTP ${r.code} for $videoId")
-                    return@withContext null
+                    return@withContext alternateIfMusicHost(url, req, client, videoId, r.code)
                 }
                 val text = r.body?.string() ?: return@withContext null
                 val json = runCatching { JSONObject(text) }.getOrNull() ?: return@withContext null
                 val status = json.optJSONObject("playabilityStatus")?.optString("status")
                 if (status != null && status != "OK") {
                     Log.d(TAG, "${client.clientName}: playability=$status for $videoId")
+                    if (status == "LOGIN_REQUIRED" || status == "UNPLAYABLE" || status == "ERROR") {
+                        return@withContext alternateIfMusicHost(url, req, client, videoId, null)
+                    }
                     return@withContext null
                 }
+                InnerTubeSession.rememberFromResponse(json)
                 json
             }
         } catch (e: Exception) {
@@ -122,34 +151,134 @@ object InnerTubePlayer {
     }
 
     /**
-     * Picks the best directly playable audio URL from a player response.
-     * Returns null when no audio format carries a plain URL (those would need
-     * signature deobfuscation, which the chosen client identities avoid).
+     * music.youtube.com rejects some third-party clients that work fine on
+     * www.youtube.com (seen as LOGIN_REQUIRED / HTTP errors). Retry once on the
+     * alternate host before the resolver falls through to the next client.
      */
-    fun selectAudioUrl(playerResponse: JSONObject): String? {
-        val streaming = playerResponse.optJSONObject("streamingData") ?: return null
+    private suspend fun alternateIfMusicHost(
+        url: String,
+        req: Request,
+        client: InnerTubeClient,
+        videoId: String,
+        failedCode: Int?,
+    ): JSONObject? = withContext(Dispatchers.IO) {
+        val alternateBase = when {
+            url.startsWith(InnerTubeClients.MUSIC_BASE) -> InnerTubeClients.YOUTUBE_BASE
+            url.startsWith(InnerTubeClients.YOUTUBE_BASE) -> InnerTubeClients.MUSIC_BASE
+            else -> return@withContext null
+        }
+        val alternateUrl = url.replaceFirst(
+            if (alternateBase == InnerTubeClients.YOUTUBE_BASE) InnerTubeClients.MUSIC_BASE else InnerTubeClients.YOUTUBE_BASE,
+            alternateBase
+        )
+        try {
+            http.newCall(req.newBuilder().url(alternateUrl).build()).execute().use { r ->
+                if (!r.isSuccessful) {
+                    Log.w(TAG, "${client.clientName}: alternate host HTTP ${r.code} for $videoId")
+                    return@withContext null
+                }
+                val text = r.body?.string() ?: return@withContext null
+                val json = runCatching { JSONObject(text) }.getOrNull() ?: return@withContext null
+                val status = json.optJSONObject("playabilityStatus")?.optString("status")
+                if (status != "OK") {
+                    Log.d(TAG, "${client.clientName}: alternate host playability=$status for $videoId")
+                    return@withContext null
+                }
+                InnerTubeSession.rememberFromResponse(json)
+                json
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "${client.clientName}: alternate host failed for $videoId: ${e.message}")
+            null
+        }
+    }
+
+    private fun attachSession(builder: Request.Builder, origin: String) {
+        YouTubeSession.cookie.value?.let { cookie ->
+            builder.header("Cookie", cookie)
+            YouTubeSession.authorizationHeader(origin)?.let { auth ->
+                builder.header("Authorization", auth)
+            }
+        }
+    }
+
+    data class AudioCandidate(
+        val url: String,
+        val bitrate: Int,
+        val isAac: Boolean,
+        val isOriginal: Boolean,
+        val signatureCipher: String? = null,
+    )
+
+    fun collectAudioCandidates(playerResponse: JSONObject): List<AudioCandidate> {
+        val streaming = playerResponse.optJSONObject("streamingData") ?: return emptyList()
 
         val candidates = mutableListOf<JSONObject>()
         streaming.optJSONArray("adaptiveFormats")?.let { addAll(it, candidates) }
         streaming.optJSONArray("formats")?.let { addAll(it, candidates) }
 
-        val playable = candidates
+        return candidates
             .filter { it.isAudioFormat() }
-            .filter { !it.optString("url", "").isBlank() }
-        if (playable.isEmpty()) return null
-
-        // Prefer original (non auto-dubbed) audio, then highest bitrate, then AAC
-        // for the widest codec support.
-        val best = playable
-            .filter { it.isOriginalAudio() }
-            .ifEmpty { playable }
-            .maxWithOrNull(
-                compareBy<JSONObject> { it.optInt("bitrate", 0) }
-                    .thenBy { if (it.optString("mimeType").contains("mp4a")) 1 else 0 }
+            .mapNotNull { format ->
+                // Direct URL first; otherwise keep the cipher for later
+                // deciphering (Blazify: signatureCipher -> deciphered URL).
+                val url = format.optString("url", "").takeIf { it.isNotBlank() }
+                if (url != null) {
+                    AudioCandidate(
+                        url = url,
+                        bitrate = format.optInt("bitrate", 0).let {
+                            if (it > 0) it else format.optInt("averageBitrate", 0)
+                        },
+                        isAac = format.optString("mimeType").contains("mp4a"),
+                        isOriginal = format.isOriginalAudio()
+                    )
+                } else {
+                    val cipher = format.optString("signatureCipher", "")
+                        .ifBlank { format.optString("cipher", "") }
+                        .takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                    AudioCandidate(
+                        url = "",
+                        bitrate = format.optInt("bitrate", 0).let {
+                            if (it > 0) it else format.optInt("averageBitrate", 0)
+                        },
+                        isAac = format.optString("mimeType").contains("mp4a"),
+                        isOriginal = format.isOriginalAudio(),
+                        signatureCipher = cipher
+                    )
+                }
+            }
+            .sortedWith(
+                compareByDescending<AudioCandidate> { it.isOriginal }
+                    .thenByDescending { it.bitrate }
+                    .thenByDescending { if (it.isAac) 1 else 0 }
             )
-            ?: return null
+    }
 
-        return best.optString("url", "").takeIf { it.isNotBlank() }
+    /**
+     * Picks the best directly playable audio URL from a player response.
+     * Returns null when no audio format carries a plain URL (those would need
+     * signature deobfuscation, which the chosen client identities avoid).
+     */
+    fun selectAudioUrl(playerResponse: JSONObject): String? {
+        val candidates = collectAudioCandidates(playerResponse)
+        val best = candidates.firstOrNull() ?: return null
+        return best.url.takeIf { it.isNotBlank() }
+    }
+
+    suspend fun resolveBestUrl(
+        playerResponse: JSONObject,
+        validate: suspend (String) -> Boolean = { validateUrl(it) },
+    ): String? {
+        for (candidate in collectAudioCandidates(playerResponse)) {
+            if (candidate.url.isNotBlank()) {
+                if (validate(candidate.url)) return candidate.url
+                continue
+            }
+            val cipher = candidate.signatureCipher ?: continue
+            val deciphered = runCatching { PlayerCipher.decipherSignatureCipher(cipher) }.getOrNull()
+            if (!deciphered.isNullOrBlank() && validate(deciphered)) return deciphered
+        }
+        return null
     }
 
     private fun addAll(array: JSONArray, into: MutableList<JSONObject>) {

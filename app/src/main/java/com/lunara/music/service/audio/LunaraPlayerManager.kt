@@ -60,6 +60,12 @@ object LunaraPlayerManager {
     private val _playbackError = MutableStateFlow<String?>(null)
     val playbackError: StateFlow<String?> = _playbackError.asStateFlow()
 
+    private var songRetryCount = 0
+
+    private companion object {
+        const val MAX_SONG_RETRIES = 3
+    }
+
     fun init(context: Context) {
         serviceContext = context.applicationContext
         startService(context)
@@ -109,6 +115,8 @@ object LunaraPlayerManager {
                     }
                     Player.STATE_READY -> {
                         _isBuffering.value = false
+                        _playbackError.value = null
+                        songRetryCount = 0
                         _durationMs.value = exoPlayer?.duration?.coerceAtLeast(0L) ?: 0L
                     }
                     Player.STATE_ENDED -> {
@@ -125,9 +133,19 @@ object LunaraPlayerManager {
                 Log.e(TAG, "Playback error: ${error.message}", error)
                 _isBuffering.value = false
                 _isPlaying.value = false
-                // The resolved stream URL may have expired or been rejected;
-                // drop it so a retry resolves a fresh one.
-                _currentSong.value?.let { StreamResolver.invalidate(it.id) }
+                val song = _currentSong.value
+                if (song != null) {
+                    // The resolved stream URL may have expired or been rejected;
+                    // drop it, resolve the next audio candidate, and retry the
+                    // same song instead of leaving the player silent.
+                    StreamResolver.invalidate(song.id)
+                    if (songRetryCount < MAX_SONG_RETRIES) {
+                        songRetryCount += 1
+                        _playbackError.value = "Retrying playback..."
+                        loadAndPlay(song)
+                        return
+                    }
+                }
                 _playbackError.value = "Couldn't play this song. Tap to retry."
             }
         })
@@ -173,6 +191,7 @@ object LunaraPlayerManager {
 
     private fun loadAndPlay(song: Song) {
         _currentSong.value = song
+        songRetryCount = 0
         _isBuffering.value = true
         _playbackError.value = null
         _currentPositionMs.value = 0L

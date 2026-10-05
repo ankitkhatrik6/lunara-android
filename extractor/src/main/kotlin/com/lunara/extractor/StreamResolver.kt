@@ -46,7 +46,6 @@ object StreamResolver {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, AudioStream>?) =
             size > MAX_CACHE_ENTRIES
     }
-    private val cacheLock = Mutex()
 
     /**
      * Serialises resolution so a burst of taps on one track costs one resolve, not one
@@ -55,6 +54,9 @@ object StreamResolver {
     private val resolveLock = Mutex()
 
     private val warmupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** Scope for fire-and-forget maintenance, so [clear] stays callable from a callback. */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /**
      * Prepares the extraction pipeline.
@@ -217,13 +219,19 @@ object StreamResolver {
     /** Above this a "low" stream stops saving anything a listener would notice. */
     private const val LOW_BITRATE_CEILING = 130_000
 
-    private suspend fun cached(videoId: String): AudioStream? = cacheLock.withLock {
-        cache[videoId]?.takeIf { !it.isExpired }
-    }
+    /**
+     * Cache access is deliberately *not* suspending.
+     *
+     * Every caller that needs to drop a stream is a callback — a player error, a stall
+     * watchdog — and forcing those into a coroutine to evict a map entry would make
+     * the eviction easy to forget at exactly the moment it matters most. Resolution
+     * still holds [resolveLock], because that does real network work.
+     */
+    private fun cached(videoId: String): AudioStream? =
+        synchronized(cache) { cache[videoId]?.takeIf { !it.isExpired } }
 
-    private suspend fun store(videoId: String, stream: AudioStream) = cacheLock.withLock {
-        cache[videoId] = stream
-    }
+    private fun store(videoId: String, stream: AudioStream) =
+        synchronized(cache) { cache[videoId] = stream }
 
     /**
      * Drops a cached stream.
@@ -231,14 +239,13 @@ object StreamResolver {
      * Called after playback fails, so a dead URL is never replayed and the next attempt
      * goes back to the network for a fresh one.
      */
-    suspend fun invalidate(videoId: String) = cacheLock.withLock {
-        cache.remove(videoId)
-        Unit
+    fun invalidate(videoId: String) {
+        synchronized(cache) { cache.remove(videoId) }
     }
 
     /** Clears everything, for a settings change or a manual retry of everything. */
-    suspend fun clear() = cacheLock.withLock {
-        cache.clear()
-        ClientHealth.reset()
+    fun clear() {
+        synchronized(cache) { cache.clear() }
+        scope.launch { ClientHealth.reset() }
     }
 }

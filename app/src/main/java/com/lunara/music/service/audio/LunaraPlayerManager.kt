@@ -347,7 +347,7 @@ object LunaraPlayerManager {
                                     "No connection to YouTube. Check your network."
                             }
                             Log.w(TAG, "Could not resolve ${song.id}: ${outcome.reason}")
-                            return@launch
+                            null
                         }
                     }
                 }
@@ -358,8 +358,9 @@ object LunaraPlayerManager {
                 _isBuffering.value = false
                 _playbackError.value = "Couldn't start this song. Check your connection and retry."
                 Log.w(TAG, "Resolve for ${song.id} failed: ${e.message}")
-                return@launch
+                null
             }
+            if (stream == null) return@launch
 
             // Bind the minting identity to this URL so the data source sends the
             // matching User-Agent / Referer on every range request.

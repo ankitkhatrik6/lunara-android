@@ -1,6 +1,7 @@
 package com.lunara.music.service.innertube
 
 import android.util.Log
+import com.lunara.extractor.ClientRegistry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -35,11 +36,11 @@ object InnerTubeSession {
         val current = YouTubeSession.visitorData
         if (!current.isNullOrBlank()) return@withContext current
 
-        for (host in listOf(InnerTubeClients.YOUTUBE_BASE, InnerTubeClients.MUSIC_BASE)) {
+        for (host in listOf(ClientRegistry.ORIGIN_YOUTUBE_MUSIC, ClientRegistry.ORIGIN_YOUTUBE)) {
             val found = runCatching {
                 val request = Request.Builder()
                     .url("$host/")
-                    .addHeader("User-Agent", InnerTubeClients.USER_AGENT_WEB)
+                    .addHeader("User-Agent", ClientRegistry.USER_AGENT_WEB)
                     .build()
                 http.newCall(request).execute().use { resp ->
                     extractVisitorData(resp.body?.string().orEmpty())

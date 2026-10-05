@@ -9,10 +9,11 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import com.lunara.extractor.ResolveFailure
+import com.lunara.extractor.StreamResolver
 import com.lunara.music.data.models.RepeatMode
 import com.lunara.music.data.models.Song
 import com.lunara.music.database.LunaraDatabase
-import com.lunara.music.service.innertube.StreamResolver
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -220,17 +221,23 @@ object LunaraPlayerManager {
         lastProgressAt = now
         Log.w(TAG, "Playback stalled with no buffer progress for ${STALL_TIMEOUT_MS}ms; re-resolving ${song.id}")
         _playbackError.value = "Stream stalled — reconnecting…"
+        // Drop the cached URL first: it is the one that just failed, and re-resolving
+        // without dropping it would hand back the same dead URL.
         StreamResolver.invalidate(song.id)
         scope.launch {
-            val replacement = StreamResolver.resolveFresh(song.id)
-            if (replacement == null) {
-                _isBuffering.value = false
-                _playbackError.value = "Couldn't stream this song"
-                return@launch
+            // The rotation may have moved on since the last resolve, and the health
+            // scoring means a different client is now the one most likely to serve.
+            val replacement = when (val outcome = StreamResolver.resolve(song.id)) {
+                is StreamResolver.Outcome.Success -> outcome.stream
+                is StreamResolver.Outcome.Failure -> {
+                    _isBuffering.value = false
+                    _playbackError.value = "Couldn't reconnect to this song"
+                    return@launch
+                }
             }
             StreamHeaders.register(replacement.url, replacement.headers)
             withContext(Dispatchers.Main) {
-                playMediaUri(song, replacement.url, replacement.contentType)
+                playMediaUri(song, replacement.url, replacement.containerMimeType)
             }
         }
     }
@@ -302,19 +309,42 @@ object LunaraPlayerManager {
                 return@launch
             }
 
-            val candidate = StreamResolver.resolve(song.id)
-            if (candidate == null) {
-                _isBuffering.value = false
-                _playbackError.value = "Couldn't stream this song"
-                return@launch
+            // Resolve a stream. The extractor mints a BotGuard token first and then rotates
+            // through clients, because without a token YouTube either bot-gates the
+            // request or hands back a URL whose media is capped at 1 MiB — which
+            // ExoPlayer experiences as an endless buffer rather than as an error.
+            val stream = when (val outcome = StreamResolver.resolve(song.id)) {
+                is StreamResolver.Outcome.Success -> outcome.stream
+                is StreamResolver.Outcome.Failure -> {
+                    _isBuffering.value = false
+                    // Say what actually went wrong. "Couldn't stream this song" for a
+                    // track YouTube has removed is technically true and completely
+                    // useless, and that vagueness is how a broken player passes for a
+                    // working one that simply has no music.
+                    _playbackError.value = when (outcome.reason) {
+                        is ResolveFailure.Unavailable ->
+                            "This song isn't available on YouTube Music"
+
+                        is ResolveFailure.Blocked ->
+                            "YouTube is rate-limiting this device. Try again shortly."
+
+                        is ResolveFailure.NoPlayableStream ->
+                            "YouTube throttled the stream. Try again in a moment."
+
+                        is ResolveFailure.Network ->
+                            "No connection to YouTube. Check your network."
+                    }
+                    Log.w(TAG, "Could not resolve ${song.id}: ${outcome.reason}")
+                    return@launch
+                }
             }
 
             // Bind the minting identity to this URL so the data source sends the
             // matching User-Agent / Referer on every range request.
-            StreamHeaders.register(candidate.url, candidate.headers)
+            StreamHeaders.register(stream.url, stream.headers)
 
             withContext(Dispatchers.Main) {
-                playMediaUri(song, candidate.url, candidate.contentType)
+                playMediaUri(song, stream.url, stream.containerMimeType)
             }
         }
     }

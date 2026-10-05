@@ -3,9 +3,10 @@ package com.lunara.music.service.download
 import android.content.Context
 import android.os.Environment
 import android.util.Log
+import com.lunara.extractor.StreamResolver
+import com.lunara.extractor.StreamValidator
 import com.lunara.music.data.models.Song
 import com.lunara.music.database.LunaraDatabase
-import com.lunara.music.service.innertube.StreamResolver
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -55,13 +56,23 @@ class DownloadManager(private val context: Context) {
             // First ensure song is in database
             db.songDao().insertOrUpdateSong(song.toEntity())
 
-            // Resolve a stream that has already been deep-validated, so we never start a
-            // download against a URL YouTube will truncate at 1 MiB.
+            // A download writes the whole file to disk, so a stream that is silently truncated at
+            // 1 MiB has to be caught here rather than discovered later as a corrupt file.
+            // This is the one caller that justifies the deep probe the playback path
+            // deliberately avoids: a truncated download is worse than a failed one.
             updateProgress(song.id, 0.15f)
-            val candidate = StreamResolver.resolve(song.id)
+            val stream = when (val outcome = StreamResolver.resolve(song.id)) {
+                is StreamResolver.Outcome.Success -> outcome.stream
+                is StreamResolver.Outcome.Failure -> {
+                    updateProgress(song.id, 0f, error = "Could not resolve audio stream")
+                    activeJobs.remove(song.id)
+                    return@withContext
+                }
+            }
 
-            if (candidate == null) {
-                updateProgress(song.id, 0f, error = "Could not resolve audio stream")
+            if (!StreamValidator.isDeeplyReadable(stream)) {
+                updateProgress(song.id, 0f, error = "Stream is truncated by the server")
+                StreamResolver.invalidate(song.id)
                 activeJobs.remove(song.id)
                 return@withContext
             }
@@ -69,8 +80,8 @@ class DownloadManager(private val context: Context) {
             // The download must be signed with the identity that minted the URL,
             // otherwise the CDN rejects it past the first megabyte.
             val req = Request.Builder()
-                .url(candidate.url)
-                .apply { candidate.headers.forEach { (k, v) -> header(k, v) } }
+                .url(stream.url)
+                .apply { stream.headers.forEach { (k, v) -> header(k, v) } }
                 .build()
 
             val outputFile = File(getDownloadsDir(), "${song.id}.m4a")
@@ -83,7 +94,7 @@ class DownloadManager(private val context: Context) {
                 }
 
                 val body = resp.body ?: throw IllegalStateException("Empty body")
-                val expectedBytes = if (candidate.contentLength > 0) candidate.contentLength else body.contentLength()
+                val expectedBytes = if (stream.contentLength > 0) stream.contentLength else body.contentLength()
                 var downloadedBytes = 0L
 
                 body.byteStream().use { input ->
@@ -104,7 +115,7 @@ class DownloadManager(private val context: Context) {
 
                 // A short read means the connection was cut: refuse to mark a
                 // truncated file as a successful download.
-                if (candidate.contentLength > 0 && downloadedBytes < candidate.contentLength) {
+                if (stream.contentLength > 0 && downloadedBytes < stream.contentLength) {
                     outputFile.delete()
                     updateProgress(song.id, 0f, error = "Stream ended early")
                     StreamResolver.invalidate(song.id)

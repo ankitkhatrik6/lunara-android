@@ -1,5 +1,6 @@
 package com.lunara.music.service.lyrics
 
+import com.lunara.extractor.CaptionApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -21,26 +22,11 @@ object YouTubeSubtitleLyricsProvider : LyricsProvider {
         album: String?,
     ): String? = withContext(Dispatchers.IO) {
         if (id.isBlank()) return@withContext null
-        val player = runCatching {
-            com.lunara.music.service.innertube.InnerTubePlayer.fetchPlayerResponse(
-                com.lunara.music.service.innertube.InnerTubeClients.STREAM_CLIENTS.first(),
-                id
-            )
-        }.getOrNull() ?: return@withContext null
-        val tracks = player.optJSONObject("captions")
-            ?.optJSONObject("playerCaptionsTracklistRenderer")
-            ?.optJSONArray("captionTracks") ?: return@withContext null
-        // Prefer English/auto, else first track.
-        var baseUrl: String? = null
-        for (i in 0 until tracks.length()) {
-            val t = tracks.optJSONObject(i) ?: continue
-            val code = t.optString("languageCode", "")
-            val url = t.optString("baseUrl", "")
-            if (url.isBlank()) continue
-            if (baseUrl == null) baseUrl = url
-            if (code.startsWith("en")) { baseUrl = url; break }
-        }
-        val xml = baseUrl?.let { LyricsHttp.get("$it&fmt=vtt") ?: LyricsHttp.get(it) }
+        // `CaptionApi` orders the tracks, preferring a human-written one in any
+        // language over an auto-generated one: the auto-generated version mishears
+        // names, and names are what a listener is checking the lyrics against.
+        val track = CaptionApi.bestTrack(id) ?: return@withContext null
+        val xml = LyricsHttp.get("${track.url}&fmt=vtt") ?: LyricsHttp.get(track.url)
             ?: return@withContext null
         vttToLrc(xml)?.takeIf { LyricsUtils.isSynced(it) }
     }

@@ -33,8 +33,8 @@ android {
     // Increment versionCode for every published update. A stable applicationId,
     // a stable signing key and a strictly increasing versionCode together are
     // what allow an APK to be installed over a previous build.
-    versionCode = 5
-    versionName = "1.4.0"
+    versionCode = 6
+    versionName = "2.0.0"
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 
@@ -104,6 +104,10 @@ dependencies {
   implementation(libs.androidx.room.ktx)
   implementation(libs.androidx.room.runtime)
   implementation(libs.coil.compose)
+
+  // LunaraExtractor: the stream-extraction engine (BotGuard PO-token minting,
+  // client rotation, stream resolution). This is what makes online playback work.
+  implementation(project(":extractor"))
 
   // Audio engine (Media3 / ExoPlayer) + OkHttp-backed streaming data source.
   implementation(libs.androidx.media3.exoplayer)

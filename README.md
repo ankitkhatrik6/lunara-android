@@ -51,7 +51,7 @@ Lunara is a free and open source music player for Android. It streams the YouTub
 | Feature | Description |
 |---------|-------------|
 | **YouTube Music catalogue** | Search, live suggestions, browse, artists, albums, and playlists through the InnerTube `WEB_REMIX` client. |
-| **Reliable playback** | Each track is resolved against the InnerTube player endpoint with a rotating set of public client identities, and every candidate URL is **proven playable before it reaches the player** — Lunara probes past the 1 MiB Google Video Server throttle boundary so a truncated stream is rejected and re-resolved instead of stalling in the buffer. Resolved streams carry the minting client's identity headers, the `n` throttling parameter is transformed from `player.js`, and a stall watchdog re-resolves a dead stream automatically. Playback runs through Media3 with lock screen and notification controls. |
+| **Reliable playback** | Each track is resolved by **LunaraExtractor**, a dedicated module that mints a BotGuard **PO token** in a hidden WebView before asking the InnerTube player endpoint. Without that token YouTube answers `LOGIN_REQUIRED`, or hands back a URL whose media is **capped at exactly 1 MiB** — which Media3 experiences as an endless buffer rather than as an error. A rotating set of client identities is ordered by live health scoring, and a stream is only handed to the player once its first bytes have been proven to arrive. Resolved streams carry the identity headers the minting client requires, a stall watchdog re-resolves a dead stream, and a stale session identity is renewed automatically instead of requiring a reinstall. |
 | **Synced lyrics** | Time-synced and plain lyrics with a priority chain of providers: Paxsenix, LRCLIB, Better Lyrics, KuGou, and LyricsPlus. |
 | **Queue management** | Play next, add to queue, reorder, remove, and clear. |
 | **Mini player and full player** | Scrubbable seek bar, repeat (all, one, off), shuffle, and a sleep timer. |
@@ -71,24 +71,57 @@ Download the latest signed APK from the [Releases](https://github.com/ankitkhatr
 ## Architecture
 
 ```text
-app/src/main/java/com/lunara/music/
-|-- LunaraApplication.kt            Application entry point and service bootstrap
-|-- MainActivity.kt                 Single activity, edge-to-edge Compose
-|-- data/models/                    Song, Album, Artist, Playlist, Lyrics models
-|-- database/                       Room entities, DAOs, LunaraDatabase
-|-- service/
-|   |-- audio/                      MediaSessionService and LunaraPlayerManager
-|   |-- innertube/                  InnerTubeService, StreamResolver, LunaraDownloader
-|   |-- download/                   Offline media DownloadManager
-|   |-- local/                      MediaStore local audio scanner
-|   |-- lyrics/                     LRCLIB synced and plain lyrics service
-|   `-- spotify/                    Spotify playlist parser and track matcher
-`-- ui/
-    |-- components/                 Player bar, artwork, rows, cards, time bar
-    |-- navigation/                 LunaraNavHost and bottom navigation
-    |-- screens/                    Home, Search, Library, Player, Settings, Details
-    `-- theme/                      Obsidian dark theme palette and typography
+lunara/
+|-- extractor/                        LunaraExtractor — the stream-extraction engine
+|   `-- src/main/kotlin/com/lunara/extractor/
+|       |-- ExtractorClient.kt        One InnerTube identity + the headers its media needs
+|       |-- ClientRegistry.kt         Every known client, in measured order of reliability
+|       |-- ClientHealth.kt           Scores clients from evidence so a good one is tried first
+|       |-- InnerTubePlayerApi.kt     The /player call and its response parsing
+|       |-- StreamResolver.kt         Resolution: token, rotation, validation, self-healing
+|       |-- StreamValidator.kt        Decides whether a URL will actually serve data
+|       |-- SessionStore.kt           Visitor identity, and renewing it when it goes stale
+|       |-- SignatureTimestamp.kt     Reads `sts` from the deployed player script
+|       |-- AudioStream.kt            The resolved stream and its reasons for failure
+|       |-- potoken/                  BotGuard VM driven from a hidden WebView
+|       `-- assets/botguard.html      The harness that runs BotGuard's obfuscated program
+|
+`-- app/src/main/java/com/lunara/music/
+    |-- LunaraApplication.kt          Application entry point and pipeline warm-up
+    |-- MainActivity.kt               Single activity, edge-to-edge Compose
+    |-- data/models/                  Song, Album, Artist, Playlist, Lyrics models
+    |-- database/                     Room entities, DAOs, LunaraDatabase
+    |-- service/
+    |   |-- audio/                    MediaSessionService, LunaraPlayerManager, header binding
+    |   |-- innertube/                Catalogue API: search, home, albums, playlists, artists
+    |   |-- download/                 Offline media DownloadManager
+    |   |-- local/                    MediaStore local audio scanner
+    |   |-- lyrics/                   Paxsenix, LRCLIB, Better Lyrics, KuGou, LyricsPlus
+    |   `-- spotify/                  Spotify playlist parser and track matcher
+    `-- ui/
+        |-- components/               Player bar, artwork, rows, cards, time bar
+        |-- navigation/               LunaraNavHost and bottom navigation
+        |-- screens/                  Home, Search, Library, Player, Settings, Details
+        `-- theme/                    Obsidian dark theme palette and typography
 ```
+
+### Why the extractor is its own module
+
+A music player whose extractor is broken does not look broken — it looks like an app
+with no music in it. Keeping extraction isolated behind one module means the part that
+decides whether playback works can be read, tested and replaced on its own, without
+touching playback or UI.
+
+### What actually makes a stream play
+
+Measured against the live API while building this:
+
+| Symptom | Cause | What Lunara does |
+|---------|-------|------------------|
+| Resolves fine, then buffers forever | Media capped at exactly 1 MiB; Media3 reads the first megabyte, asks for more, gets `403` | Mint a BotGuard PO token first, so the CDN serves the whole file |
+| `LOGIN_REQUIRED` on every track | The request presented an identity the catalogue has stopped recognising | Visitor identity is minted per session and **renewed automatically** when every client refuses at once |
+| Sixteen seconds before anything plays | Every play tried five clients, four of which cannot ever work | Client health scoring tries the working one first and rests the rest |
+| Nothing plays at all | The validator deep-probed past the 1 MiB boundary, saw the `403` every capped stream returns, and discarded **working** streams | Only a failure on the *first* bytes rejects a stream; a deep failure does not |
 
 ## Technology Stack
 

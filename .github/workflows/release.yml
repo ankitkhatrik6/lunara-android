@@ -29,7 +29,15 @@ jobs:
         run: chmod +x gradlew || true
 
       - name: Build signed release APK
+        # Signing credentials fall back to the stable keystore committed at the
+        # repository root, so every release is signed with the same key and Android
+        # accepts updates over an installed build.
         run: ./gradlew assembleRelease
+        env:
+          KEYSTORE_PATH: ${{ secrets.KEYSTORE_PATH }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
       - name: Prepare APK
         run: |

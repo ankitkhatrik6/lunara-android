@@ -18,16 +18,25 @@ import java.util.concurrent.TimeUnit
 /**
  * Hosts the ExoPlayer instance and configures it for YouTube streaming.
  *
- * Two things matter here for playback to actually work:
+ * Three things matter here for playback to actually work:
  *
- * 1. **Per-track headers.** A googlevideo URL is only served to the same
- *    identity that minted it, so [LunaraPlayerManager] registers the resolved
- *    stream's headers with [StreamHeaders] and [StreamHeaderInterceptor] applies
- *    them to every media request. Sending a single hard-coded browser
- *    User-Agent (what Lunara used to do) gets a 403 partway through a track.
+ * 1. **Request-time resolution, in chunks.** The player never holds a googlevideo
+ *    URL open for a whole song: [StreamResolvingDataSource] sits above the HTTP
+ *    stack, resolves the video id to a fresh URL at every load and caps each load
+ *    at 512 KiB (Blazify's `ResolvingDataSource` + `CHUNK_LENGTH` design). An
+ *    expired, capped or refused URL therefore costs one chunk — never the song.
  *
- * 2. **Buffering behaviour.** The load control is sized for progressive
- *    network audio, and audio-focus/ becoming-noisy handling stay enabled.
+ * 2. **Per-chunk headers.** A googlevideo URL is only served to the same
+ *    identity that minted it, so every resolved URL's headers are registered
+ *    with [StreamHeaders] and [StreamHeaderInterceptor] applies them to each
+ *    range request. Sending a single hard-coded browser User-Agent (what Lunara
+ *    used to do) gets a 403 partway through a track.
+ *
+ * 3. **Buffering behaviour.** The load control mirrors Blazify's `BufferAhead`:
+ *    start after 750 ms, resume after a stall once 2 s are banked (a shorter
+ *    resume than the old 3 s is what stops the "buffers, plays, buffers" cadence
+ *    from feeling like a metronome), hold up to 4 minutes on an unmetered link
+ *    with a 16 MiB ceiling. Audio-focus and becoming-noisy handling stay enabled.
  */
 class LunaraMediaSessionService : MediaSessionService() {
     private var mediaSession: MediaSession? = null
@@ -55,17 +64,22 @@ class LunaraMediaSessionService : MediaSessionService() {
         // Redirects are handled by the shared OkHttp client above.
         val upstreamFactory = OkHttpDataSource.Factory(httpClient)
         val dataSourceFactory = DefaultDataSource.Factory(this, upstreamFactory)
-        val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
+        // The resolving layer sits *above* DefaultDataSource so it can turn a
+        // schemeless video id into an http URL (and local content:// / file URIs
+        // pass straight through it untouched).
+        val mediaSourceFactory =
+            DefaultMediaSourceFactory(StreamResolvingDataSource.Factory(dataSourceFactory))
 
-        // Buffer generously: buffering is what keeps a variable connection from
-        // stalling mid-track.
+        // Buffer like Blazify: enough ahead that an ordinary drop in signal passes
+        // unheard, quick enough to start that the first note is not a wait.
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                /* minBufferMs = */ 30_000,
-                /* maxBufferMs = */ 120_000,
-                /* bufferForPlaybackMs = */ 1_500,
-                /* bufferForPlaybackAfterRebufferMs = */ 3_000,
+                /* minBufferMs = */ 50_000,
+                /* maxBufferMs = */ 240_000,
+                /* bufferForPlaybackMs = */ 750,
+                /* bufferForPlaybackAfterRebufferMs = */ 2_000,
             )
+            .setTargetBufferBytes(16L * 1024 * 1024)
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
 

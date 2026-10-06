@@ -9,7 +9,6 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
-import com.lunara.extractor.ResolveFailure
 import com.lunara.extractor.StreamResolver
 import com.lunara.music.data.models.RepeatMode
 import com.lunara.music.data.models.Song
@@ -67,6 +66,13 @@ object LunaraPlayerManager {
     private const val MAX_SONG_RETRIES = 3
 
     /**
+     * How many times one user-initiated load may silently reconnect a stalled
+     * stream before it says so out loud. Bounded because the unbounded version is
+     * the failure that reads as "buffer 3 seconds, pause, forever".
+     */
+    private const val MAX_STALL_RECOVERIES = 3
+
+    /**
      * How long the buffer may sit completely still before we treat the stream
      * as dead. Must comfortably exceed a slow-but-working connection.
      */
@@ -77,6 +83,15 @@ object LunaraPlayerManager {
     private var lastBuffered = -1L
     private var lastProgressAt = 0L
     private var stallRecovered = false
+    private var stallRecoveryCount = 0
+
+    /**
+     * The URI and container of the item being played — what a stall reconnects
+     * with. For an online song the URI is the video id, so re-preparing it sends
+     * the resolving data source back to the network for a fresh address.
+     */
+    private var currentMediaUri: String? = null
+    private var currentContentType: String? = null
 
     fun init(context: Context) {
         serviceContext = context.applicationContext
@@ -127,7 +142,11 @@ object LunaraPlayerManager {
                     Player.STATE_READY -> {
                         _isBuffering.value = false
                         _playbackError.value = null
+                        // Ready means data flowed and playback moved: both budgets
+                        // are per-failure, not per-song, so a track that plays and
+                        // later stumbles still gets its full recovery allowance.
                         songRetryCount = 0
+                        stallRecoveryCount = 0
                         _durationMs.value = exoPlayer?.duration?.coerceAtLeast(0L) ?: 0L
                     }
                     Player.STATE_ENDED -> {
@@ -146,6 +165,10 @@ object LunaraPlayerManager {
                 _isPlaying.value = false
                 val song = _currentSong.value
                 if (song != null) {
+                    // Where the listener had got to. The retry re-enters the stream
+                    // at the same second through the resolving data source instead
+                    // of starting the song over from nothing.
+                    val resumeAt = exoPlayer?.currentPosition ?: 0L
                     // The resolved stream URL may have expired or been rejected;
                     // drop it, resolve the next audio candidate, and retry the
                     // same song instead of leaving the player silent.
@@ -153,7 +176,10 @@ object LunaraPlayerManager {
                     if (songRetryCount < MAX_SONG_RETRIES) {
                         songRetryCount += 1
                         _playbackError.value = "Retrying playback..."
-                        loadAndPlay(song)
+                        // isRetry stops loadAndPlay zeroing the retry budget. That
+                        // reset used to make every failure look like a first failure,
+                        // so a dead URL retried forever instead of ever giving up.
+                        loadAndPlay(song, resumeFromMs = resumeAt, isRetry = true)
                         return
                     }
                 }
@@ -217,27 +243,32 @@ object LunaraPlayerManager {
         if (stallRecovered) return
 
         val song = _currentSong.value ?: return
+        val uri = currentMediaUri ?: return
         stallRecovered = true
         lastProgressAt = now
-        Log.w(TAG, "Playback stalled with no buffer progress for ${STALL_TIMEOUT_MS}ms; re-resolving ${song.id}")
+
+        // The budget is what separates "reconnecting" from "looping forever". It is
+        // refilled whenever the player reaches READY (see the listener above), so
+        // this only ever stops a stream that silently dies over and over.
+        if (stallRecoveryCount >= MAX_STALL_RECOVERIES) {
+            Log.w(TAG, "Playback stalled $MAX_STALL_RECOVERIES times; giving up on ${song.id}")
+            _isBuffering.value = false
+            _playbackError.value = "Couldn't keep this song playing. Tap to retry."
+            return
+        }
+        stallRecoveryCount += 1
+
+        // The reconnect continues from here rather than restarting the song. The
+        // cached URL is dropped first — it is the one that just failed — so the
+        // resolving data source's next open mints a fresh one through the health-
+        // ordered client rotation.
+        val resumeAt = player.currentPosition
+        Log.w(TAG, "Playback stalled with no buffer progress for ${STALL_TIMEOUT_MS}ms; reconnecting ${song.id} at ${resumeAt}ms")
         _playbackError.value = "Stream stalled — reconnecting…"
-        // Drop the cached URL first: it is the one that just failed, and re-resolving
-        // without dropping it would hand back the same dead URL.
         StreamResolver.invalidate(song.id)
         scope.launch {
-            // The rotation may have moved on since the last resolve, and the health
-            // scoring means a different client is now the one most likely to serve.
-            val replacement = when (val outcome = StreamResolver.resolve(song.id)) {
-                is StreamResolver.Outcome.Success -> outcome.stream
-                is StreamResolver.Outcome.Failure -> {
-                    _isBuffering.value = false
-                    _playbackError.value = "Couldn't reconnect to this song"
-                    return@launch
-                }
-            }
-            StreamHeaders.register(replacement.url, replacement.headers)
             withContext(Dispatchers.Main) {
-                playMediaUri(song, replacement.url, replacement.containerMimeType)
+                playMediaUri(song, uri, currentContentType, resumePositionMs = resumeAt)
             }
         }
     }
@@ -265,12 +296,22 @@ object LunaraPlayerManager {
 
     private var loadJob: Job? = null
 
-    private fun loadAndPlay(song: Song) {
+    /**
+     * @param resumeFromMs where a recovery should continue from; 0 for a fresh
+     *   user-initiated play.
+     * @param isRetry true when this reload is the player recovering from an error.
+     *   Retries must not zero the retry budget (that reset is what used to turn a
+     *   dead URL into an infinite "buffering…" loop) nor the stall budget.
+     */
+    private fun loadAndPlay(song: Song, resumeFromMs: Long = 0L, isRetry: Boolean = false) {
         _currentSong.value = song
-        songRetryCount = 0
+        if (!isRetry) {
+            songRetryCount = 0
+            stallRecoveryCount = 0
+        }
         _isBuffering.value = true
         _playbackError.value = null
-        _currentPositionMs.value = 0L
+        _currentPositionMs.value = resumeFromMs
 
         // Reset the stall watchdog for the new track.
         lastPosition = -1L
@@ -299,7 +340,13 @@ object LunaraPlayerManager {
                 ?.takeIf { it.isNotBlank() }
                 ?.let { path -> File(path).takeIf { it.exists() && it.length() > 0 } }
             if (localFile != null) {
-                withContext(Dispatchers.Main) { playMediaUri(song, Uri.fromFile(localFile).toString()) }
+                withContext(Dispatchers.Main) {
+                    playMediaUri(
+                        song,
+                        Uri.fromFile(localFile).toString(),
+                        resumePositionMs = resumeFromMs,
+                    )
+                }
                 return@launch
             }
 
@@ -313,7 +360,9 @@ object LunaraPlayerManager {
             //    media scanner is a stable, reusable value.
             val persisted = song.streamUrl?.takeIf { it.startsWith("content://") }
             if (persisted != null) {
-                withContext(Dispatchers.Main) { playMediaUri(song, persisted) }
+                withContext(Dispatchers.Main) {
+                    playMediaUri(song, persisted, resumePositionMs = resumeFromMs)
+                }
                 return@launch
             }
 
@@ -333,19 +382,7 @@ object LunaraPlayerManager {
                             // track YouTube has removed is technically true and completely
                             // useless, and that vagueness is how a broken player passes for a
                             // working one that simply has no music.
-                            _playbackError.value = when (outcome.reason) {
-                                is ResolveFailure.Unavailable ->
-                                    "This song isn't available on YouTube Music"
-
-                                is ResolveFailure.Blocked ->
-                                    "YouTube is rate-limiting this device. Try again shortly."
-
-                                is ResolveFailure.NoPlayableStream ->
-                                    "YouTube throttled the stream. Try again in a moment."
-
-                                is ResolveFailure.Network ->
-                                    "No connection to YouTube. Check your network."
-                            }
+                            _playbackError.value = outcome.reason.toUserMessage()
                             Log.w(TAG, "Could not resolve ${song.id}: ${outcome.reason}")
                             null
                         }
@@ -366,13 +403,24 @@ object LunaraPlayerManager {
             // matching User-Agent / Referer on every range request.
             StreamHeaders.register(stream.url, stream.headers)
 
+            // The player is handed the *video id*, not the URL. From here on the
+            // resolving data source owns the address: it resolves at every load,
+            // caps each load at 512 KiB and swaps in a fresh URL the moment the old
+            // one expires or is refused — which is what stops a mid-song death from
+            // becoming "buffer, pause, repeat". (The register above pre-warms the
+            // header registry; the data source re-registers on every open.)
             withContext(Dispatchers.Main) {
-                playMediaUri(song, stream.url, stream.containerMimeType)
+                playMediaUri(song, song.id, stream.containerMimeType, resumeFromMs)
             }
         }
     }
 
-    private fun playMediaUri(song: Song, mediaUri: String, contentType: String? = null) {
+    private fun playMediaUri(
+        song: Song,
+        mediaUri: String,
+        contentType: String? = null,
+        resumePositionMs: Long = 0L,
+    ) {
         val player = exoPlayer
         if (player == null) {
             serviceContext?.let { startService(it) }
@@ -387,15 +435,29 @@ object LunaraPlayerManager {
             .setArtworkUri(song.thumbnailUrl?.let { Uri.parse(it) })
             .build()
 
+        // A schemeless URI is the video id, and the custom cache key is how the
+        // resolving data source finds it again at every chunk open. Real addresses
+        // (file://, content://) need neither and pass through untouched.
+        val isVideoId = Uri.parse(mediaUri).scheme == null
         val mediaItem = MediaItem.Builder()
             .setUri(mediaUri)
             .setMediaId(song.id)
             .setMimeType(contentType)
             .setMediaMetadata(metadata)
+            .apply { if (isVideoId) setCustomCacheKey(song.id) }
             .build()
+
+        // Remembered for the stall watchdog: a reconnect re-enters with exactly
+        // this URI, so an online song goes back to the network for a fresh address
+        // while a local file is simply reopened.
+        currentMediaUri = mediaUri
+        currentContentType = contentType
+        // Every prepared item gets its own chance at the watchdog.
+        stallRecovered = false
 
         player.setMediaItem(mediaItem)
         player.prepare()
+        if (resumePositionMs > 0L) player.seekTo(resumePositionMs)
         player.playWhenReady = true
         _isPlaying.value = true
 

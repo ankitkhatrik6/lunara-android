@@ -1,37 +1,65 @@
 package com.lunara.music.service.audio
 
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.Response
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Registry mapping a stream URL to the HTTP headers it must be requested with.
  *
  * A googlevideo URL is only served to the same InnerTube identity that minted
  * it, so the headers that produced the URL have to travel with every media
- * request. [LunaraPlayerManager] registers them the moment a stream resolves and
+ * request. [LunaraPlayerManager] registers them the moment a stream resolves,
+ * [StreamResolvingDataSource] re-registers them at every chunk open, and
  * [StreamHeaderInterceptor] applies them to the request.
  *
- * The map is bounded so a long listening session cannot grow it without limit.
+ * Two properties matter for playback:
+ *
+ *  - **Access-ordered LRU.** The old map evicted an arbitrary `ConcurrentHashMap`
+ *    key, which in a long session could drop the identity of the URL currently
+ *    playing — every later range request then went out anonymously and was
+ *    refused. An LRU can only ever evict what has not been used longest.
+ *  - **Host-level fallback.** The exact URL string can differ from the request
+ *    OkHttp ends up making (normalisation, a CDN rewrite). The identity headers
+ *    are per minting client, and googlevideo hosts carry no per-URL variance, so
+ *    a request that does not match exactly still finds its headers by host.
  */
 object StreamHeaders {
     private const val MAX_ENTRIES = 16
 
-    private val headersByUrl = ConcurrentHashMap<String, Map<String, String>>()
+    private val headersByUrl =
+        object : LinkedHashMap<String, Map<String, String>>(16, 0.75f, true) {
+            override fun removeEldestEntry(
+                eldest: MutableMap.MutableEntry<String, Map<String, String>>,
+            ): Boolean = size > MAX_ENTRIES
+        }
 
-    /** Binds [url] to [headers] for as long as the current item is playing. */
+    /** Binds [url] to [headers] for as long as the stream is played. */
     fun register(url: String, headers: Map<String, String>) {
         if (url.isBlank() || headers.isEmpty()) return
-        while (headersByUrl.size >= MAX_ENTRIES) {
-            val oldest = headersByUrl.keys.firstOrNull() ?: break
-            headersByUrl.remove(oldest)
-        }
-        headersByUrl[url] = headers
+        synchronized(headersByUrl) { headersByUrl[url] = headers }
     }
 
-    fun lookup(url: String): Map<String, String> = headersByUrl[url].orEmpty()
+    fun lookup(url: String): Map<String, String> {
+        synchronized(headersByUrl) {
+            headersByUrl[url]?.let { return it }
 
-    fun clear() = headersByUrl.clear()
+            val host = hostOf(url) ?: return emptyMap()
+            // Access order: the first entry on the same host is the most recently
+            // used one, which is the identity the live request most likely wants.
+            for ((registeredUrl, headers) in headersByUrl) {
+                if (hostOf(registeredUrl) == host) return headers
+            }
+        }
+        return emptyMap()
+    }
+
+    fun clear() {
+        synchronized(headersByUrl) { headersByUrl.clear() }
+    }
+
+    /** The host part of an http(s) URL, or null when the string is not one. */
+    internal fun hostOf(url: String): String? = url.toHttpUrlOrNull()?.host
 }
 
 /**

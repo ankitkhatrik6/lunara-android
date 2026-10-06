@@ -92,7 +92,7 @@ lunara/
     |-- data/models/                  Song, Album, Artist, Playlist, Lyrics models
     |-- database/                     Room entities, DAOs, LunaraDatabase
     |-- service/
-    |   |-- audio/                    MediaSessionService, LunaraPlayerManager, header binding
+    |   |-- audio/                    MediaSessionService, LunaraPlayerManager, resolving/chunked data source, header binding
     |   |-- innertube/                Catalogue API: search, home, albums, playlists, artists
     |   |-- download/                 Offline media DownloadManager
     |   |-- local/                    MediaStore local audio scanner
@@ -122,13 +122,14 @@ Measured against the live API while building this:
 | `LOGIN_REQUIRED` on every track | The request presented an identity the catalogue has stopped recognising | Visitor identity is minted per session and **renewed automatically** when every client refuses at once |
 | Sixteen seconds before anything plays | Every play tried five clients, four of which cannot ever work | Client health scoring tries the working one first and rests the rest |
 | Nothing plays at all | The validator deep-probed past the 1 MiB boundary, saw the `403` every capped stream returns, and discarded **working** streams | Only a failure on the *first* bytes rejects a stream; a deep failure does not |
+| Buffers a few seconds, pauses, repeats forever | The player held one long-lived googlevideo connection; when the CDN capped, expired or dropped it mid-song, playback restarted from zero and hit the same wall again | The player is never handed a URL: a resolving data source resolves the video id **at every load**, caps each load at 512 KiB, and swaps in a fresh URL in place — a dead address costs one chunk, never the song |
 
 ## Technology Stack
 
 | Area | Choice |
 |------|--------|
 | Platform | Android, Kotlin, Jetpack Compose, Material 3 |
-| Audio | AndroidX Media3 (ExoPlayer and MediaSession) with an OkHttp data source |
+| Audio | AndroidX Media3 (ExoPlayer and MediaSession) with an OkHttp data source behind a Blazify-style resolving data source: request-time stream resolution in 512 KiB chunks with in-place URL refresh |
 | Extraction | In-app InnerTube client (player endpoint, client rotation, signature + `n` throttling decipher) and deep stream validation |
 | Lyrics | Paxsenix, LRCLIB, Better Lyrics, KuGou, and LyricsPlus |
 | Database | AndroidX Room |

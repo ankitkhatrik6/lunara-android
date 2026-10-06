@@ -42,7 +42,7 @@ object CipherDeobfuscator {
     // changes (epoch advances), the cached WebView may have been built from a missing or wrong
     // config for the current player, so getOrCreateWebView() rebuilds it instead of trusting it for
     // the life of the process — the staleness that previously required an app restart to recover.
-    private var builtConfigEpoch = -1
+    private var builtConfigEpoch = -1L
 
     // Written on the decipher coroutine (Dispatchers.IO) but read via lastUsedPlayerHash from the
     // Compose UI thread (song-details sheet), so @Volatile to publish the write across threads.

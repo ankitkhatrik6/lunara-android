@@ -194,9 +194,10 @@ class StreamResolvingDataSource private constructor(
         )
         return when (outcome) {
             is StreamResolver.Outcome.Success -> outcome.stream
-            is StreamResolver.Outcome.Failure ->
-                IOException(outcome.reason.toUserMessage())
-                    .also { Log.w(TAG, "Resolve failed for $videoId: ${outcome.reason}") }
+            is StreamResolver.Outcome.Failure -> {
+                Log.w(TAG, "Resolve failed for $videoId: ${outcome.reason}")
+                throw IOException(outcome.reason.toUserMessage())
+            }
         }
     }
 

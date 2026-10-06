@@ -79,7 +79,7 @@ class LunaraMediaSessionService : MediaSessionService() {
                 /* bufferForPlaybackMs = */ 750,
                 /* bufferForPlaybackAfterRebufferMs = */ 2_000,
             )
-            .setTargetBufferBytes(16L * 1024 * 1024)
+            .setTargetBufferBytes(16 * 1024 * 1024)
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
 

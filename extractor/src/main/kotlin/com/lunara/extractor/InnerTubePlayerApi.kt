@@ -169,29 +169,32 @@ object InnerTubePlayerApi {
         return formats
             .filter { isAudioOnly(it) }
             .mapNotNull { format ->
-                // A format carrying only a signature cipher would need `player.js` worked
-                // out before it could be used. The clients in the rotation hand back
-                // direct URLs, so a ciphered entry means an unexpected response shape.
+                // Either an address, or a signature cipher that the resolver will feed
+                // through the site's own player script before anything is probed.
+                // Neither present means the entry is not a stream at all.
                 val url = format.optString("url").takeIf { it.isNotBlank() }
-                    ?: return@mapNotNull null
+                val cipher = format.optString("signatureCipher").takeIf { it.isNotBlank() }
+                    ?: format.optString("cipher").takeIf { it.isNotBlank() }
+                if (url == null && cipher == null) return@mapNotNull null
 
                 val bitrate = format.optInt("bitrate").takeIf { it > 0 }
                     ?: format.optInt("averageBitrate").takeIf { it > 0 }
                     ?: 0
 
                 AudioStream(
-                    url = url,
+                    url = url.orEmpty(),
                     itag = format.optInt("itag"),
                     mimeType = format.optString("mimeType"),
                     bitrate = bitrate,
                     contentLength = format.optString("contentLength").toLongOrNull() ?: 0L,
                     clientName = client.displayName,
                     headers = headers,
-                    expiresAtMs = maxOf(AudioStream.expiryFromUrl(url), declaredExpiryMs ?: 0L),
+                    expiresAtMs = maxOf(AudioStream.expiryFromUrl(url.orEmpty()), declaredExpiryMs ?: 0L),
                     approxDurationMs = durationMs,
                     audioQuality = format.optString("audioQuality").takeIf { it.isNotBlank() },
                     audioChannels = format.optInt("audioChannels").coerceAtLeast(2),
                     isLiveStream = isLive,
+                    signatureCipher = cipher,
                 ).withSafeLifetime()
             }
             .sortedWith(streamPreference)

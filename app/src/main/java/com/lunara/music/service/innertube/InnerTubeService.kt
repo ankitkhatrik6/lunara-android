@@ -438,6 +438,112 @@ object InnerTubeService {
         result
     }
 
+    /**
+     * Where the detail page's header lives has moved between response layouts, so every
+     * shape is read rather than one: the legacy top-level `header`, and the current
+     * two-column layout where it sits as the first section of the tab content. With no
+     * header the screen shows its placeholder title and a blank byline.
+     */
+    private fun detailHeader(json: JSONObject): JSONObject? {
+        val legacy = json.optJSONObject("header")
+        legacy?.optJSONObject("musicDetailHeaderRenderer")?.let { return it }
+        legacy?.optJSONObject("musicResponsiveHeaderRenderer")?.let { return it }
+
+        val sections = json.optJSONObject("contents")
+            ?.optJSONObject("twoColumnBrowseResultsRenderer")
+            ?.optJSONArray("tabs")?.optJSONObject(0)
+            ?.optJSONObject("tabRenderer")
+            ?.optJSONObject("content")
+            ?.optJSONObject("sectionListRenderer")
+            ?.optJSONArray("contents") ?: return null
+        for (i in 0 until sections.length()) {
+            val section = sections.optJSONObject(i) ?: continue
+            section.optJSONObject("musicResponsiveHeaderRenderer")?.let { return it }
+            section.optJSONObject("musicDetailHeaderRenderer")?.let { return it }
+        }
+        return null
+    }
+
+    /** Reads a `nextContinuationData` token out of a shelf or section list. */
+    private fun collectContinuations(from: JSONObject, into: MutableList<String>) {
+        val continuations = from.optJSONArray("continuations") ?: return
+        for (i in 0 until continuations.length()) {
+            continuations.optJSONObject(i)
+                ?.optJSONObject("nextContinuationData")
+                ?.optString("continuation")
+                ?.takeIf { it.isNotBlank() }
+                ?.let { into.add(it) }
+        }
+    }
+
+    /** The track shelves of a browse response, plus the tokens that page past the first. */
+    private data class BrowseShelves(
+        val shelves: List<JSONObject>,
+        val continuations: List<String>,
+    )
+
+    /**
+     * Finds every track shelf the response carries, in every layout YouTube serves.
+     *
+     * Today's two-column layout puts the tracks in `secondaryContents`, beside the tab
+     * that holds only the header — walking the tab alone finds nothing, which is how a
+     * detail screen ends up showing "0 tracks" against a response that has them all.
+     * The legacy single-column layout keeps them in the tab's section list, so both are
+     * read, along with the shelf-level and section-level continuation tokens.
+     */
+    private fun browseShelves(json: JSONObject): BrowseShelves {
+        val shelves = mutableListOf<JSONObject>()
+        val continuations = mutableListOf<String>()
+
+        fun consumeSections(sections: JSONArray?) {
+            for (i in 0 until (sections?.length() ?: 0)) {
+                val section = sections?.optJSONObject(i) ?: continue
+                val shelf = section.optJSONObject("musicShelfRenderer")
+                    ?: section.optJSONObject("musicPlaylistShelfRenderer")
+                    ?: continue
+                shelves.add(shelf)
+                collectContinuations(shelf, continuations)
+            }
+        }
+
+        val contents = json.optJSONObject("contents")
+        val twoColumn = contents?.optJSONObject("twoColumnBrowseResultsRenderer")
+
+        twoColumn?.optJSONObject("secondaryContents")
+            ?.optJSONObject("sectionListRenderer")
+            ?.let { sectionList ->
+                consumeSections(sectionList.optJSONArray("contents"))
+                collectContinuations(sectionList, continuations)
+            }
+
+        val tabs = twoColumn?.optJSONArray("tabs")
+            ?: contents?.optJSONObject("singleColumnBrowseResultsRenderer")?.optJSONArray("tabs")
+        for (t in 0 until (tabs?.length() ?: 0)) {
+            val sectionList = tabs?.optJSONObject(t)
+                ?.optJSONObject("tabRenderer")
+                ?.optJSONObject("content")
+                ?.optJSONObject("sectionListRenderer") ?: continue
+            consumeSections(sectionList.optJSONArray("contents"))
+            collectContinuations(sectionList, continuations)
+        }
+
+        return BrowseShelves(shelves, continuations.distinct())
+    }
+
+    /**
+     * Pulls a four-digit year out of a header subtitle ("Single • 2026"), because the
+     * subtitle is the only place the year is still carried.
+     */
+    private fun extractYear(header: JSONObject?): String? {
+        val runs = header?.optJSONObject("subtitle")?.optJSONArray("runs") ?: return null
+        for (i in 0 until runs.length()) {
+            val text = runs.optJSONObject(i)?.optString("text", "")?.trim() ?: continue
+            if (text.matches(Regex("""\d{4}"""))) return text
+        }
+        return null
+    }
+
+
     suspend fun getAlbum(browseId: String): Album? = withContext(Dispatchers.IO) {
         try {
             val reqBody = JSONObject().apply {
@@ -456,29 +562,15 @@ object InnerTubeService {
                 val body = resp.body?.string() ?: return@withContext null
                 val json = JSONObject(body)
 
-                val header = json.optJSONObject("header")?.optJSONObject("musicDetailHeaderRenderer")
+                val header = detailHeader(json)
                 val title = extractRunsText(header?.optJSONObject("title"))
                 val subtitle = extractRunsText(header?.optJSONObject("subtitle"))
                 val thumb = extractThumbnail(header?.optJSONObject("thumbnail"))
+                val year = extractYear(header)
 
                 val tracks = mutableListOf<Song>()
-                // Albums arrive in several layouts: musicShelfRenderer under the
-                // first section, musicPlaylistShelfRenderer, or a bare list of
-                // items. Walk every section and accept any of them.
-                val sections = json.optJSONObject("contents")
-                    ?.optJSONObject("singleColumnBrowseResultsRenderer")
-                    ?.optJSONArray("tabs")
-                    ?.optJSONObject(0)
-                    ?.optJSONObject("tabRenderer")
-                    ?.optJSONObject("content")
-                    ?.optJSONObject("sectionListRenderer")
-                    ?.optJSONArray("contents") ?: JSONArray()
-
-                for (s in 0 until sections.length()) {
-                    val sec = sections.optJSONObject(s) ?: continue
-                    val contents = sec.optJSONObject("musicShelfRenderer")?.optJSONArray("contents")
-                        ?: sec.optJSONObject("musicPlaylistShelfRenderer")?.optJSONArray("contents")
-                        ?: continue
+                for (shelf in browseShelves(json).shelves) {
+                    val contents = shelf.optJSONArray("contents") ?: continue
                     for (i in 0 until contents.length()) {
                         val item = contents.optJSONObject(i)
                             ?.optJSONObject("musicResponsiveListItemRenderer") ?: continue
@@ -507,6 +599,7 @@ object InnerTubeService {
                     id = browseId,
                     title = title,
                     artist = subtitle,
+                    year = year,
                     thumbnailUrl = thumb,
                     trackCount = tracks.size,
                     tracks = tracks
@@ -545,12 +638,32 @@ object InnerTubeService {
                 val body = resp.body?.string() ?: return@withContext null
                 val json = JSONObject(body)
 
-                val header = json.optJSONObject("header")?.optJSONObject("musicDetailHeaderRenderer")
-                    ?: json.optJSONObject("header")?.optJSONObject("musicResponsiveHeaderRenderer")
+                val header = detailHeader(json)
                 val title = extractRunsText(header?.optJSONObject("title"))
                 val desc = extractRunsText(header?.optJSONObject("description"))
+                    .ifBlank { extractRunsText(header?.optJSONObject("subtitle")) }
                 val thumb = extractThumbnail(header?.optJSONObject("thumbnail"))
 
+                val tracks = mutableListOf<Song>()
+                val continuations = mutableListOf<String>()
+
+                // Every shelf the response carries, wherever it lives. Today's layout
+                // keeps them in secondaryContents beside the tab — a tab-only walk
+                // sees only the header, which is how a playlist showed "0 tracks".
+                val shelfData = browseShelves(json)
+                continuations.addAll(shelfData.continuations)
+                for (shelf in shelfData.shelves) {
+                    val contents = shelf.optJSONArray("contents") ?: continue
+                    for (i in 0 until contents.length()) {
+                        val item = contents.optJSONObject(i)?.optJSONObject("musicResponsiveListItemRenderer") ?: continue
+                        val songsTemp = mutableListOf<Song>()
+                        parseListItem(item, songsTemp, mutableListOf(), mutableListOf(), mutableListOf())
+                        tracks.addAll(songsTemp)
+                    }
+                }
+
+                // Carousel shelves (radio/mix listings) live in the tab content and
+                // carry their playable ids only in the two-row items.
                 val tabs = json.optJSONObject("contents")
                     ?.optJSONObject("twoColumnBrowseResultsRenderer")
                     ?.optJSONArray("tabs")
@@ -558,8 +671,6 @@ object InnerTubeService {
                         ?.optJSONObject("singleColumnBrowseResultsRenderer")
                         ?.optJSONArray("tabs") ?: JSONArray()
 
-                val tracks = mutableListOf<Song>()
-                val continuations = mutableListOf<String>()
                 for (t in 0 until tabs.length()) {
                     val sectionList = tabs.optJSONObject(t)
                         ?.optJSONObject("tabRenderer")
@@ -568,37 +679,20 @@ object InnerTubeService {
                         ?.optJSONArray("contents") ?: continue
 
                     for (s in 0 until sectionList.length()) {
-                        val sec = sectionList.optJSONObject(s) ?: continue
-                        val shelf = sec.optJSONObject("musicPlaylistShelfRenderer")
-                            ?: sec.optJSONObject("musicShelfRenderer")
-                        if (shelf == null) {
-                            val carousel = sec.optJSONObject("musicCarouselShelfRenderer")
-                            if (carousel != null) {
-                                val contents = carousel.optJSONArray("contents") ?: JSONArray()
-                                for (i in 0 until contents.length()) {
-                                    val twoRow = contents.optJSONObject(i)
-                                        ?.optJSONObject("musicTwoRowItemRenderer") ?: continue
-                                    val st = extractRunsText(twoRow.optJSONObject("title"))
-                                    val sa = extractRunsText(twoRow.optJSONObject("subtitle"))
-                                    val sh = extractThumbnail(twoRow.optJSONObject("thumbnailRenderer"))
-                                    val vid = twoRow.optJSONObject("navigationEndpoint")
-                                        ?.optJSONObject("watchEndpoint")?.optString("videoId").orEmpty()
-                                    if (vid.isNotBlank()) {
-                                        tracks.add(Song(id = vid, title = st, artist = sa, thumbnailUrl = sh))
-                                    }
-                                }
-                            }
-                            continue
-                        }
-                        shelf.optJSONArray("continuations")?.optJSONObject(0)
-                            ?.optJSONObject("nextContinuationData")?.optString("continuation")
-                            ?.takeIf { it.isNotBlank() }?.let { continuations.add(it) }
-                        val contents = shelf.optJSONArray("contents") ?: continue
+                        val carousel = sectionList.optJSONObject(s)
+                            ?.optJSONObject("musicCarouselShelfRenderer") ?: continue
+                        val contents = carousel.optJSONArray("contents") ?: JSONArray()
                         for (i in 0 until contents.length()) {
-                            val item = contents.optJSONObject(i)?.optJSONObject("musicResponsiveListItemRenderer") ?: continue
-                            val songsTemp = mutableListOf<Song>()
-                            parseListItem(item, songsTemp, mutableListOf(), mutableListOf(), mutableListOf())
-                            tracks.addAll(songsTemp)
+                            val twoRow = contents.optJSONObject(i)
+                                ?.optJSONObject("musicTwoRowItemRenderer") ?: continue
+                            val st = extractRunsText(twoRow.optJSONObject("title"))
+                            val sa = extractRunsText(twoRow.optJSONObject("subtitle"))
+                            val sh = extractThumbnail(twoRow.optJSONObject("thumbnailRenderer"))
+                            val vid = twoRow.optJSONObject("navigationEndpoint")
+                                ?.optJSONObject("watchEndpoint")?.optString("videoId").orEmpty()
+                            if (vid.isNotBlank()) {
+                                tracks.add(Song(id = vid, title = st, artist = sa, thumbnailUrl = sh))
+                            }
                         }
                     }
                 }

@@ -2,6 +2,8 @@ package com.lunara.extractor
 
 import android.util.Log
 import android.content.Context
+import android.net.Uri
+import com.lunara.extractor.cipher.CipherDeobfuscator
 import com.lunara.extractor.potoken.PoTokenGenerator
 import com.lunara.extractor.potoken.PoTokenResult
 import kotlinx.coroutines.CoroutineScope
@@ -12,6 +14,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Turns a video id into a stream that has been proven to serve data.
@@ -83,10 +86,17 @@ object StreamResolver {
      */
     fun init(context: Context) {
         PoTokenGenerator.init(context)
+        // Loads the player-config table and hands the cipher stack its context. Must
+        // precede any resolve: the signature timestamp and the stream-URL fixups both
+        // run through it, and the WebView machinery is lateinit without it.
+        CipherDeobfuscator.initialize(context)
         ClientHealth.prewarm()
         warmupScope.launch {
             runCatching { SessionStore.ensure() }
             runCatching { PoTokenGenerator.prewarm(context) }
+            // Building the cipher WebView parses ~2.8 MB of player JS and takes seconds;
+            // warmed here the first song does not pay for it.
+            runCatching { CipherDeobfuscator.prewarm() }
         }
     }
 
@@ -118,7 +128,15 @@ object StreamResolver {
             // One token set serves every client: it is bound to the session, not to a
             // track, so re-minting per client would cost seconds for nothing.
             val tokens = PoTokenGenerator.tokensFor(videoId, visitorData)
-            val signatureTimestamp = if (tokens != null) SignatureTimestamp.get() else null
+            // The stamp of the player this cipher will decipher with: a signature minted
+            // against one player generation and unscrambled by another is refused by the
+            // CDN, and that refusal reports nothing. The iframe-API reader — same page
+            // the player hash comes from — is the fallback when the script is unfetchable.
+            val signatureTimestamp = if (tokens != null) {
+                CipherDeobfuscator.signatureTimestamp() ?: SignatureTimestamp.get()
+            } else {
+                null
+            }
 
             var outcome = resolveOnce(videoId, quality, visitorData, tokens, signatureTimestamp)
 
@@ -189,16 +207,22 @@ object StreamResolver {
             }
 
             sawPlayable = true
+            var sawAddress = false
             for (candidate in selectCandidates(response.streams, quality)) {
                 if (candidate.isExpired) continue
-                if (StreamValidator.isPlayable(candidate)) {
+                // A raw format is not yet an address the CDN will serve: the cipher has
+                // to be unscrambled, the throttle solved and the streaming token attached
+                // before the probe below can mean anything.
+                val stream = finalizeStream(candidate, client, videoId, tokens) ?: continue
+                sawAddress = true
+                if (StreamValidator.isPlayable(stream)) {
                     ClientHealth.recordSuccess(client)
                     Log.i(
                         TAG,
                         "Resolved $videoId via ${client.displayName}: " +
-                            "${candidate.bitrate / 1000} kbps ${candidate.containerMimeType}",
+                            "${stream.bitrate / 1000} kbps ${stream.containerMimeType}",
                     )
-                    return Outcome.Success(candidate)
+                    return Outcome.Success(stream)
                 }
             }
 
@@ -206,6 +230,12 @@ object StreamResolver {
             // is worse than a refusal: the user waited for a stream that was never
             // going to play.
             ClientHealth.recordBadStream(client)
+            if (sawAddress) {
+                // A whole client's worth of refusals may mean the config table is behind
+                // a player rotation. Rate-limited inside, fire-and-forget here: never
+                // worth stalling a resolve that is still working.
+                scope.launch { runCatching { CipherDeobfuscator.onStreamRejected() } }
+            }
             Log.d(TAG, "${client.displayName} resolved but every URL it returned was refused")
         }
 
@@ -243,6 +273,89 @@ object StreamResolver {
                 .thenBy { it.bitrate },
         )
     }
+
+    /**
+     * Turns one raw format into the address the CDN will actually serve.
+     *
+     * Three things stand between what `/player` handed back and a URL that plays, and
+     * order matters — the probe in [resolveOnce] must see the finished address or it
+     * validates the wrong thing:
+     *
+     *  1. A signature cipher is unscrambled through the site's own player script.
+     *     Bounded, because a player shape the cipher cannot read never finishes, and
+     *     one unusable candidate must not stall the rest of the rotation.
+     *  2. The throttle (`n`) parameter is solved for web clients: the content server
+     *     serves a whole song only to whoever solves it and 403s everybody else.
+     *  3. The streaming PO token is attached as `pot=`, without which the media server
+     *     serves the first megabyte and then stops — a stream that starts and dies.
+     *
+     * Returns null when the format cannot be finished (an unsolvable cipher), which
+     * removes only that candidate; the next one may be a plain direct URL.
+     */
+    private suspend fun finalizeStream(
+        stream: AudioStream,
+        client: ExtractorClient,
+        videoId: String,
+        tokens: PoTokenResult?,
+    ): AudioStream? {
+        var url = stream.url
+
+        stream.signatureCipher?.let { cipher ->
+            val deciphered = withTimeoutOrNull(CIPHER_TIMEOUT_MS) {
+                CipherDeobfuscator.deobfuscateStreamUrl(cipher, videoId)
+            }
+            if (deciphered == null) {
+                Log.d(TAG, "Signature cipher did not resolve for $videoId — skipping candidate")
+                return null
+            }
+            url = deciphered
+        }
+
+        if (client.clientName in WEB_CLIENTS) {
+            val original = url
+            if ("&n=" in original || "?n=" in original || "/n/" in original) {
+                // Unchanged means it could not be done, not that there was nothing to
+                // do — the transform hands the address back as it found it when the
+                // player script is in a shape it cannot read, and that address still
+                // carries its throttle. One retry covers the first attempt landing
+                // while the shared WebView was being rebuilt after a renderer death.
+                val solved = CipherDeobfuscator.transformNParamInUrl(original)
+                url = if (solved != original) {
+                    solved
+                } else {
+                    val retried = if ("/n/" in original) {
+                        CipherDeobfuscator.transformNParamInPath(original)
+                    } else {
+                        CipherDeobfuscator.transformNParamInUrl(original)
+                    }
+                    if (retried != original) {
+                        retried
+                    } else {
+                        Log.w(TAG, "n-transform unavailable for $videoId")
+                        original
+                    }
+                }
+            }
+
+            tokens?.streamingDataPoToken
+                ?.takeIf { it.isNotBlank() && "pot=" !in url }
+                ?.let { pot ->
+                    val separator = if ('?' in url) '&' else '?'
+                    url = "$url$separator$pot=${Uri.encode(pot)}"
+                }
+        }
+
+        return if (url == stream.url) stream else stream.copy(url = url, signatureCipher = null)
+    }
+
+    /**
+     * The client family whose media addresses carry the throttle `n` and accept a
+     * `pot=` parameter. The native clients in the rotation mint addresses with neither.
+     */
+    private val WEB_CLIENTS = setOf("WEB", "WEB_REMIX", "WEB_CREATOR", "TVHTML5")
+
+    /** A cipher that never answers is a candidate to skip, not a resolve to abandon. */
+    private const val CIPHER_TIMEOUT_MS = 2_500L
 
     /** Above this a "low" stream stops saving anything a listener would notice. */
     private const val LOW_BITRATE_CEILING = 130_000

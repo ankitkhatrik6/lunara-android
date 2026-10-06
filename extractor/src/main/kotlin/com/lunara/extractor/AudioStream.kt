@@ -25,6 +25,14 @@ data class AudioStream(
     val audioQuality: String? = null,
     val audioChannels: Int = 2,
     val isLiveStream: Boolean = false,
+    /**
+     * The raw `signatureCipher`/`cipher` payload when the response withheld the URL.
+     *
+     * A ciphered format travels unresolved on purpose: unscrambling it means running
+     * the site's own player script, which lives in the resolver rather than in the
+     * layer that merely reports what `/player` said. Null once resolved.
+     */
+    val signatureCipher: String? = null,
 ) {
     val isExpired: Boolean
         get() = expiresAtMs > 0L && expiresAtMs <= System.currentTimeMillis()

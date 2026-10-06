@@ -3,6 +3,7 @@ package com.lunara.music.service.audio
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.SystemClock
 import android.util.Log
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
@@ -70,13 +71,22 @@ object LunaraPlayerManager {
      * stream before it says so out loud. Bounded because the unbounded version is
      * the failure that reads as "buffer 3 seconds, pause, forever".
      */
-    private const val MAX_STALL_RECOVERIES = 3
+    private const val MAX_STALL_RECOVERIES = 5
 
     /**
      * How long the buffer may sit completely still before we treat the stream
-     * as dead. Must comfortably exceed a slow-but-working connection.
+     * as dead. Long enough that a slow-but-working connection (or a seek's
+     * short rebuffer) never trips it, short enough that a truly dead URL does
+     * not leave the UI spinning for a minute.
      */
-    private const val STALL_TIMEOUT_MS = 15_000L
+    private const val STALL_TIMEOUT_MS = 25_000L
+
+    /**
+     * Minimum gap between two stall recoveries for the same song. Without it a
+     * dead stream would reconnect in a tight loop; with only a one-shot flag
+     * the second death would strand the song buffering forever.
+     */
+    private const val RECOVER_COOLDOWN_MS = 30_000L
 
     // Stall-watchdog state.
     private var lastPosition = -1L
@@ -123,11 +133,51 @@ object LunaraPlayerManager {
     private fun setupPlayerListener() {
         exoPlayer?.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
-                _isPlaying.value = playing
-                // The position/stall tracker is started when an item is prepared
+                // Actual audio output state. This is the ONLY writer that may turn
+                // the play/pause affordance to "Play" mid-song: buffering, seeks
+                // and stall recoveries all keep playWhenReady=true, so deriving
+                // _isPlaying from the buffering state is exactly what painted a
+                // "paused" UI over a song that was about to keep playing.
+                // Deliberately NOT `_isPlaying = playing`: ExoPlayer reports
+                // isPlaying=false through every rebuffer and seek, and painting
+                // that as "paused" is the flicker users read as an auto-pause
+                // mid-song. The affordance follows playWhenReady (user intent)
+                // via onPlayWhenReadyChanged below; position tracking starts in
+                // playMediaUri, NOT here, because a stalled stream never reports
+                // isPlaying=true and gating the watchdog on it would blind it.
                 // (see playMediaUri), NOT here: a stalled stream never reports
                 // isPlaying = true, so gating it on this callback would mean the
                 // one failure we most need to catch is the one we never watch.
+            }
+
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                // The play/pause affordance follows *intent*, not audio output:
+                // isPlaying drops to false for every rebuffer and seek while the
+                // song is still meant to be playing, and surfacing that as
+                // "paused" is the flicker users read as auto-pause mid-song.
+                if (_currentSong.value != null &&
+                    exoPlayer?.playbackState != Player.STATE_ENDED
+                ) {
+                    _isPlaying.value = playWhenReady
+                }
+            }
+
+            override fun onPositionDiscontinuity(
+                oldPosition: Player.PositionInfo,
+                newPosition: Player.PositionInfo,
+                reason: Int,
+            ) {
+                // A seek must never pause and must not trip the stall watchdog:
+                // re-baseline it so the position jump and the short rebuffer
+                // after a fast-forward are not mistaken for a dead stream.
+                if (reason == Player.DISCONTINUITY_REASON_SEEK ||
+                    reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT
+                ) {
+                    lastPosition = newPosition.positionMs
+                    exoPlayer?.let { lastBuffered = it.bufferedPosition }
+                    lastProgressAt = SystemClock.elapsedRealtime()
+                    _currentPositionMs.value = newPosition.positionMs
+                }
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -162,7 +212,10 @@ object LunaraPlayerManager {
             override fun onPlayerError(error: PlaybackException) {
                 Log.e(TAG, "Playback error: ${error.message}", error)
                 _isBuffering.value = false
-                _isPlaying.value = false
+                // _isPlaying is left alone on purpose: the playWhenReady listener
+                // reports the truth right after this, and the retry below keeps
+                // playing — writing false first is the flash of "paused" users
+                // see on errors the app was about to recover from.
                 val song = _currentSong.value
                 if (song != null) {
                     // Where the listener had got to. The retry re-enters the stream
@@ -221,13 +274,13 @@ object LunaraPlayerManager {
         if (player.playbackState != Player.STATE_BUFFERING) {
             lastPosition = -1L
             lastBuffered = -1L
-            lastProgressAt = System.currentTimeMillis()
+            lastProgressAt = SystemClock.elapsedRealtime()
             return
         }
 
         val position = player.currentPosition
         val buffered = player.bufferedPosition
-        val now = System.currentTimeMillis()
+        val now = SystemClock.elapsedRealtime()
 
         if (position != lastPosition || buffered != lastBuffered) {
             lastPosition = position
@@ -240,10 +293,14 @@ object LunaraPlayerManager {
         // progress check above already resets this window, so we only reach
         // here when the buffer genuinely has not moved.
         if (now - lastProgressAt < STALL_TIMEOUT_MS) return
-        if (stallRecovered) return
 
         val song = _currentSong.value ?: return
         val uri = currentMediaUri ?: return
+        // One recovery per buffering episode is not enough: a capped URL dies,
+        // the fresh one dies the same way, and a pure one-shot flag would
+        // strand the song buffering forever. Allow re-recovery once the last
+        // one is old; the count budget below is what still stops a true loop.
+        if (stallRecovered && now - lastProgressAt < RECOVER_COOLDOWN_MS) return
         stallRecovered = true
         lastProgressAt = now
 
@@ -316,7 +373,7 @@ object LunaraPlayerManager {
         // Reset the stall watchdog for the new track.
         lastPosition = -1L
         lastBuffered = -1L
-        lastProgressAt = System.currentTimeMillis()
+        lastProgressAt = SystemClock.elapsedRealtime()
         stallRecovered = false
 
         // Record history in local Room database
@@ -458,8 +515,9 @@ object LunaraPlayerManager {
         player.setMediaItem(mediaItem)
         player.prepare()
         if (resumePositionMs > 0L) player.seekTo(resumePositionMs)
+        // playWhenReady=true fires onPlayWhenReadyChanged, which is the single
+        // writer of the play/pause affordance — no manual _isPlaying write here.
         player.playWhenReady = true
-        _isPlaying.value = true
 
         // Watch from the moment the item is prepared: a truncated stream will sit
         // in STATE_BUFFERING forever without ever reaching isPlaying.
@@ -468,27 +526,30 @@ object LunaraPlayerManager {
 
     fun togglePlayPause() {
         val player = exoPlayer ?: return
-        if (player.isPlaying) {
+        if (player.playWhenReady) {
             player.pause()
-            _isPlaying.value = false
         } else {
             player.play()
-            _isPlaying.value = true
         }
     }
 
     fun pause() {
         exoPlayer?.pause()
-        _isPlaying.value = false
     }
 
     fun resume() {
+        // The playWhenReady listener updates the affordance; writing it here
+        // as well would only risk racing the listener.
         exoPlayer?.play()
-        _isPlaying.value = true
     }
 
     fun seekTo(positionMs: Long) {
-        exoPlayer?.seekTo(positionMs)
+        val player = exoPlayer ?: return
+        // Preserve the play intent across the seek and say so explicitly:
+        // a fast-forward must never come back paused.
+        val resume = player.playWhenReady
+        player.seekTo(positionMs)
+        player.playWhenReady = resume
         _currentPositionMs.value = positionMs
     }
 

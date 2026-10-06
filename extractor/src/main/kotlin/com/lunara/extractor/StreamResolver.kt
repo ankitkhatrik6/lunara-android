@@ -124,39 +124,9 @@ object StreamResolver {
                     // Another caller may have resolved this while this one waited for the lock.
                     cached(videoId)?.let { return@withLock Outcome.Success(it) }
 
-            val visitorData = SessionStore.ensure()
-            // One token set serves every client: it is bound to the session, not to a
-            // track, so re-minting per client would cost seconds for nothing.
-            val tokens = PoTokenGenerator.tokensFor(videoId, visitorData)
-            // The stamp of the player this cipher will decipher with: a signature minted
-            // against one player generation and unscrambled by another is refused by the
-            // CDN, and that refusal reports nothing. The iframe-API reader — same page
-            // the player hash comes from — is the fallback when the script is unfetchable.
-            val signatureTimestamp = if (tokens != null) {
-                CipherDeobfuscator.signatureTimestamp() ?: SignatureTimestamp.get()
-            } else {
-                null
-            }
-
-            var outcome = resolveOnce(videoId, quality, visitorData, tokens, signatureTimestamp)
-
-            // Every client failing together is the signature of a session the catalogue
-            // has stopped recognising, not of a broken track. Renew once and retry: this
-            // is what lets the app recover on its own after YouTube invalidates an
-            // identity, instead of needing a reinstall.
-            if (outcome is Outcome.Failure && outcome.reason is ResolveFailure.Blocked) {
-                if (SessionStore.renewIfStale()) {
-                    Log.i(TAG, "Renewing the session and retrying $videoId")
-                    val freshVisitorData = SessionStore.ensure()
-                    val freshTokens = PoTokenGenerator.tokensFor(videoId, freshVisitorData)
-                    outcome = resolveOnce(
-                        videoId, quality, freshVisitorData, freshTokens, signatureTimestamp,
-                    )
-                }
-            }
-
-            if (outcome is Outcome.Success) store(videoId, outcome.stream)
-            outcome
+                    val outcome = resolveUncached(videoId, quality)
+                    if (outcome is Outcome.Success) store(videoId, outcome.stream)
+                    outcome
                 }
             }
         } catch (e: TimeoutCancellationException) {
@@ -165,9 +135,52 @@ object StreamResolver {
         }
     }
 
+    /**
+     * One uncached resolve: token, rotation, self-healing retry. No cache reads or
+     * writes; callers own those. Shared by [resolve] (locked, cached) and
+     * [resolveFreshBlocking] (loading thread, cache bypassed).
+     */
+    private suspend fun resolveUncached(
+        videoId: String,
+        quality: StreamQuality = StreamQuality.AUTO,
+    ): Outcome {
+        val visitorData = SessionStore.ensure()
+        // One token set serves every client: it is bound to the session, not to a
+        // track, so re-minting per client would cost seconds for nothing.
+        val tokens = PoTokenGenerator.tokensFor(videoId, visitorData)
+        // The stamp of the player this cipher will decipher with: a signature minted
+        // against one player generation and unscrambled by another is refused by the
+        // CDN, and that refusal reports nothing. The iframe-API reader — same page
+        // the player hash comes from — is the fallback when the script is unfetchable.
+        val signatureTimestamp = if (tokens != null) {
+            CipherDeobfuscator.signatureTimestamp() ?: SignatureTimestamp.get()
+        } else {
+            null
+        }
+
+        var outcome = resolveOnce(videoId, quality, visitorData, tokens, signatureTimestamp)
+
+        // Every client failing together is the signature of a session the catalogue
+        // has stopped recognising, not of a broken track. Renew once and retry: this
+        // is what lets the app recover on its own after YouTube invalidates an
+        // identity, instead of needing a reinstall.
+        if (outcome is Outcome.Failure && outcome.reason is ResolveFailure.Blocked) {
+            if (SessionStore.renewIfStale()) {
+                Log.i(TAG, "Renewing the session and retrying $videoId")
+                val freshVisitorData = SessionStore.ensure()
+                val freshTokens = PoTokenGenerator.tokensFor(videoId, freshVisitorData)
+                outcome = resolveOnce(
+                    videoId, quality, freshVisitorData, freshTokens, signatureTimestamp,
+                )
+            }
+        }
+        return outcome
+    }
+
     /** Whole-resolve budget: token + rotation + probes must never hang the UI. */
     private const val RESOLVE_TIMEOUT_MS = 60_000L
-/** One full pass over the client rotation. */
+
+    /** One full pass over the client rotation. */
     private suspend fun resolveOnce(
         videoId: String,
         quality: StreamQuality,
@@ -207,7 +220,13 @@ object StreamResolver {
             }
 
             sawPlayable = true
+            // Prefer a stream proven to serve data past the 1 MiB throttle wall: a
+            // first-byte-only URL plays ~64s (two 512 KiB chunks) and then buffer-loops
+            // on the third chunk — the "stops at 1:04" failure. Candidates are finalized
+            // lazily so the common case (the first URL is good) pays for one cipher and
+            // two probes, not every format's cipher.
             var sawAddress = false
+            var shallowFallback: AudioStream? = null
             for (candidate in selectCandidates(response.streams, quality)) {
                 if (candidate.isExpired) continue
                 // A raw format is not yet an address the CDN will serve: the cipher has
@@ -215,15 +234,31 @@ object StreamResolver {
                 // before the probe below can mean anything.
                 val stream = finalizeStream(candidate, client, videoId, tokens) ?: continue
                 sawAddress = true
-                if (StreamValidator.isPlayable(stream)) {
+                if (!StreamValidator.isPlayable(stream)) continue
+                if (StreamValidator.isDeeplyReadable(stream)) {
                     ClientHealth.recordSuccess(client)
                     Log.i(
                         TAG,
                         "Resolved $videoId via ${client.displayName}: " +
-                            "${stream.bitrate / 1000} kbps ${stream.containerMimeType}",
+                            "${stream.bitrate / 1000} kbps ${stream.containerMimeType} (deep)",
                     )
                     return Outcome.Success(stream)
                 }
+                // Inconclusive deep probe (timeout/dropped second connection) must not
+                // reject a stream the first-byte check accepted — but a terminal 403/410
+                // past the throttle wall is a capped URL and is never a fallback.
+                if (shallowFallback == null && !StreamValidator.isCapped(stream)) {
+                    shallowFallback = stream
+                }
+            }
+            if (shallowFallback != null) {
+                ClientHealth.recordSuccess(client)
+                Log.i(
+                    TAG,
+                    "Resolved $videoId via ${client.displayName}: " +
+                        "${shallowFallback.bitrate / 1000} kbps ${shallowFallback.containerMimeType}",
+                )
+                return Outcome.Success(shallowFallback)
             }
 
             // The client said OK and every URL it produced was refused on contact. That
@@ -382,6 +417,37 @@ object StreamResolver {
      */
     fun invalidate(videoId: String) {
         synchronized(cache) { cache.remove(videoId) }
+    }
+
+    /**
+     * Resolves [videoId] on the player's loading thread, bypassing the cache.
+     *
+     * The loading thread cannot suspend, so this runs a bounded blocking resolve.
+     * Used after a mid-song refusal (capped/expired URL): the cache is dropped first
+     * and the returned stream — if any — is stored, so the retry that follows heals
+     * in place on a fresh URL instead of looping on the same dead one.
+     */
+    fun resolveFreshBlocking(videoId: String): AudioStream? {
+        invalidate(videoId)
+        return try {
+            kotlinx.coroutines.runBlocking {
+                kotlinx.coroutines.withTimeoutOrNull(25_000L) { resolveUncached(videoId) }
+            }?.let { outcome ->
+                when (outcome) {
+                    is Outcome.Success -> {
+                        store(videoId, outcome.stream)
+                        outcome.stream
+                    }
+                    is Outcome.Failure -> {
+                        Log.w(TAG, "Fresh resolve failed for $videoId: ${outcome.reason}")
+                        null
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Fresh resolve crashed for $videoId: ${e.message}")
+            null
+        }
     }
 
     /** Clears everything, for a settings change or a manual retry of everything. */

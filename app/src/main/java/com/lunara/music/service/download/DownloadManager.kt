@@ -58,8 +58,8 @@ class DownloadManager(private val context: Context) {
 
             // A download writes the whole file to disk, so a stream that is silently truncated at
             // 1 MiB has to be caught here rather than discovered later as a corrupt file.
-            // This is the one caller that justifies the deep probe the playback path
-            // deliberately avoids: a truncated download is worse than a failed one.
+            // The resolver prefers deep-proven streams for playback too, but here the probe is
+            // mandatory: a truncated download is worse than a failed one.
             updateProgress(song.id, 0.15f)
             val stream = when (val outcome = StreamResolver.resolve(song.id)) {
                 is StreamResolver.Outcome.Success -> outcome.stream

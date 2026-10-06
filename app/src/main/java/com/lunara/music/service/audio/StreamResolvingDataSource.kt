@@ -2,11 +2,13 @@ package com.lunara.music.service.audio
 
 import android.net.Uri
 import android.util.Log
+import androidx.media3.common.C
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.TransferListener
 import com.lunara.extractor.AudioStream
+import com.lunara.extractor.ClientHealth
 import com.lunara.extractor.ResolveFailure
 import com.lunara.extractor.StreamResolver
 import kotlinx.coroutines.runBlocking
@@ -37,6 +39,24 @@ private const val STREAM_CHUNK_LENGTH = 512L * 1024L
 
 /** HTTP codes that mean "this address is dead", as opposed to "this connection failed". */
 private val REFUSED_CODES = setOf(401, 403, 410)
+
+/** "The range starts past the end of the file" — a real end of stream, not a refusal. */
+private const val RANGE_NOT_SATISFIABLE = 416
+
+/**
+ * The response code when this failure is the CDN refusing the address outright
+ * (expired, capped at 1 MiB, or the identity moved on), or null for any other
+ * I/O failure — a dropped connection, a timeout — which the same URL may yet
+ * survive. Matching on [HttpDataSource.InvalidResponseCodeException] is what keeps
+ * "this address is dead" distinct from "this connection failed".
+ */
+private fun IOException.refusedCode(): Int? =
+    (this as? HttpDataSource.InvalidResponseCodeException)
+        ?.responseCode
+        ?.takeIf { it in REFUSED_CODES }
+
+/** Whether this failure means the address itself is dead (see [refusedCode]). */
+private fun IOException.isRefused(): Boolean = refusedCode() != null
 
 /**
  * Resolves stream URLs at request time and reads them in fixed-size chunks.
@@ -82,6 +102,12 @@ class StreamResolvingDataSource private constructor(
     private var chunkStart = 0L
     private var chunkBytesRead = 0L
 
+    /** Declared stream length when known; guards the capped-EOS heuristic at real EOF. */
+    private var expectedEnd = -1L
+
+    /** Minting client of the current URL, so a capped/dead URL rests that client. */
+    private var lastClientName: String? = null
+
     /** One in-place recovery per open; a second failure belongs to the player's retry policy. */
     private var recoveredDuringRead = false
 
@@ -106,6 +132,8 @@ class StreamResolvingDataSource private constructor(
         var attempt = 0
         while (true) {
             val stream = resolveStream(id)
+            lastClientName = stream.clientName
+            expectedEnd = stream.contentLength.takeIf { it > 0 } ?: -1L
             StreamHeaders.register(stream.url, stream.headers)
             try {
                 val bytes = delegate.open(chunkSpecFor(dataSpec, stream.url))
@@ -116,11 +144,29 @@ class StreamResolvingDataSource private constructor(
                 // A refusal means this URL is dead (expired, capped at 1 MiB, or the
                 // identity moved on); anything else is a connection that may yet work
                 // on a second try. Either way the retry is one bounded round trip.
-                val code = (e as? HttpDataSource.InvalidResponseCodeException)?.responseCode
-                val refused = code != null && code in REFUSED_CODES
-                if (refused) {
-                    Log.w(TAG, "CDN refused $id (HTTP $code); re-resolving")
+                // Rest the minting client on a refusal so the retry resolves through a
+                // different client instead of minting the same capped URL again.
+                if (e.isRefused()) {
+                    Log.w(TAG, "CDN refused $id (${e.refusedCode()}); re-resolving", e)
                     StreamResolver.invalidate(id)
+                    lastClientName?.let { ClientHealth.recordBadStreamBlocking(it) }
+                    StreamResolver.resolveFreshBlocking(id)?.let { fresh ->
+                        lastClientName = fresh.clientName
+                        expectedEnd = fresh.contentLength.takeIf { it > 0 } ?: -1L
+                        StreamHeaders.register(fresh.url, fresh.headers)
+                        try {
+                            val bytes = delegate.open(chunkSpecFor(dataSpec, fresh.url))
+                            chunkStart = dataSpec.position + dataSpec.uriPositionOffset
+                            chunkBytesRead = 0
+                            return bytes
+                        } catch (e2: IOException) {
+                            if (attempt < 1) {
+                                attempt += 1
+                                continue
+                            }
+                            throw e2
+                        }
+                    }
                 }
                 if (attempt < 1) {
                     attempt += 1
@@ -135,11 +181,51 @@ class StreamResolvingDataSource private constructor(
         try {
             val read = delegate.read(buffer, offset, length)
             if (read > 0) chunkBytesRead += read
+            if (read == C.RESULT_END_OF_INPUT && !recoveredDuringRead) {
+                // Capped URLs die with 403 at the 1 MiB wall, but a server that ends a
+                // chunk early (exact EOF, short file) also reports EOS. Only a short
+                // read far below the chunk size, well before the stream's known end,
+                // means the CDN cut us off. Reconnect in place on a fresh URL so the
+                // song keeps playing; if even that cannot be opened, fail loudly so the
+                // player's retry re-resolves from this position — silently returning
+                // EOS here is what turns a capped URL into a song that stops early.
+                val id = videoId
+                val spec = baseSpec
+                if (id != null && spec != null && chunkBytesRead < STREAM_CHUNK_LENGTH / 2 &&
+                    (expectedEnd < 0 || chunkStart + chunkBytesRead < expectedEnd - 64L * 1024L)
+                ) {
+                    recoveredDuringRead = true
+                    val resumeAt = chunkStart + chunkBytesRead
+                    Log.w(TAG, "Stream for $id ended early at byte $resumeAt; re-resolving")
+                    StreamResolver.invalidate(id)
+                    lastClientName?.let { ClientHealth.recordBadStreamBlocking(it) }
+                    runCatching { delegate.close() }
+                    val fresh = StreamResolver.resolveFreshBlocking(id)
+                        ?: throw IOException("The stream stopped early. Check your connection and retry.")
+                    lastClientName = fresh.clientName
+                    expectedEnd = fresh.contentLength.takeIf { it > 0 } ?: -1L
+                    StreamHeaders.register(fresh.url, fresh.headers)
+                    val resumed = try {
+                        reopenAt(spec, fresh.url, resumeAt)
+                        true
+                    } catch (e2: HttpDataSource.InvalidResponseCodeException) {
+                        // The offset starts past the end of the file: this really was
+                        // the end of the stream, not a cut-off, so say EOS and let the
+                        // player finish the song normally.
+                        if (e2.responseCode == RANGE_NOT_SATISFIABLE) false else throw e2
+                    }
+                    if (!resumed) return C.RESULT_END_OF_INPUT
+                    return delegate.read(buffer, offset, length)
+                }
+            }
             return read
         } catch (e: IOException) {
             // The address is fine — the connection under it is not. Reopen on a fresh
             // connection at the exact byte offset so the buffer keeps growing from
-            // where it stopped instead of the song starting over.
+            // where it stopped instead of the song starting over. A 401/403/410 is
+            // the address itself dying (capped/expired): drop it and resolve fresh
+            // first, so the retry cannot loop on the same URL — that loop is the
+            // "buffer, pause, buffer" stall past ~1:04.
             val id = videoId ?: throw e
             val spec = baseSpec ?: throw e
             if (recoveredDuringRead) throw e
@@ -149,19 +235,38 @@ class StreamResolvingDataSource private constructor(
             Log.w(TAG, "Connection for $id died at byte $resumeAt; reconnecting in place", e)
             runCatching { delegate.close() }
 
+            if (e.isRefused()) {
+                StreamResolver.invalidate(id)
+                lastClientName?.let { ClientHealth.recordBadStreamBlocking(it) }
+            }
             val stream = resolveStream(id)
+            lastClientName = stream.clientName
+            expectedEnd = stream.contentLength.takeIf { it > 0 } ?: -1L
             StreamHeaders.register(stream.url, stream.headers)
-            delegate.open(
-                spec.buildUpon()
-                    .setUri(Uri.parse(stream.url))
-                    .setPosition(resumeAt)
-                    .setLength(STREAM_CHUNK_LENGTH)
-                    .build(),
-            )
-            chunkStart = resumeAt
-            chunkBytesRead = 0
+            reopenAt(spec, stream.url, resumeAt)
             return delegate.read(buffer, offset, length)
         }
+    }
+
+    /**
+     * Reopens the delegate on [url] at the absolute byte offset [resumeAt], capped at
+     * what remains of the current 512 KiB chunk, and rebases the chunk counters there.
+     *
+     * Both mid-read recovery paths go through this so the resume offset, the remaining
+     * chunk budget and the bookkeeping can never drift apart — a drift here resumes the
+     * song at the wrong byte, which reads as a click or a short rebuffer.
+     */
+    private fun reopenAt(spec: DataSpec, url: String, resumeAt: Long) {
+        val remaining = (chunkStart + STREAM_CHUNK_LENGTH - resumeAt).coerceAtLeast(1L)
+        delegate.open(
+            spec.buildUpon()
+                .setUri(Uri.parse(url))
+                .setPosition(resumeAt)
+                .setLength(remaining)
+                .build(),
+        )
+        chunkStart = resumeAt
+        chunkBytesRead = 0
     }
 
     override fun getUri(): Uri? = delegate.getUri() ?: baseSpec?.uri
@@ -176,6 +281,8 @@ class StreamResolvingDataSource private constructor(
             videoId = null
             chunkStart = 0L
             chunkBytesRead = 0L
+            expectedEnd = -1L
+            lastClientName = null
             recoveredDuringRead = false
         }
     }

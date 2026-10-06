@@ -5,8 +5,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 
 /**
  * Remembers which clients are currently working, so a healthy one is tried first.
@@ -60,9 +58,26 @@ object ClientHealth {
     )
 
     private val states = LinkedHashMap<String, State>()
-    private val lock = Mutex()
+    /**
+     * Guard for [recordBadStreamBlocking]: the loading thread and resolves touch the
+     * same client bookkeeping, but the loading thread cannot suspend, so it must never
+     * wait on a coroutine lock. All readers/writers of [states] go through
+     * [stateSnapshot]/[applyBlocking] below.
+     */
+    private val blockingGuard = Any()
 
-    private fun stateFor(key: String): State = states.getOrPut(key) { State() }
+    /** Copy of one client's bookkeeping, safe to read off any thread. */
+    private data class Snapshot(val score: Int, val restedUntil: Long)
+
+    private fun stateSnapshot(key: String): Snapshot = synchronized(blockingGuard) {
+        val s = states.getOrPut(key) { State() }
+        Snapshot(s.score, s.restedUntil)
+    }
+
+    private fun applyBlocking(key: String, update: (State) -> Unit) =
+        synchronized(blockingGuard) {
+            update(states.getOrPut(key) { State() })
+        }
 
     /**
      * The clients to try, best first, with rested ones moved to the back.
@@ -73,14 +88,13 @@ object ClientHealth {
     fun ordered(): List<ExtractorClient> {
         val now = System.currentTimeMillis()
         return ClientRegistry.rotation().sortedWith(
-            compareBy<ExtractorClient> { stateFor(it.displayName).restedUntil > now }
-                .thenByDescending { stateFor(it.displayName).score },
+            compareBy<ExtractorClient> { stateSnapshot(it.displayName).restedUntil > now }
+                .thenByDescending { stateSnapshot(it.displayName).score },
         )
     }
 
     /** Records that [client] produced a stream which passed its first-byte check. */
-    suspend fun recordSuccess(client: ExtractorClient) = lock.withLock {
-        val state = stateFor(client.displayName)
+    suspend fun recordSuccess(client: ExtractorClient) = applyBlocking(client.displayName) { state ->
         state.score = (state.score + SUCCESS_POINTS).coerceAtMost(20)
         state.consecutiveFailures = 0
         state.restedUntil = 0L
@@ -92,8 +106,7 @@ object ClientHealth {
      * `retryable` distinguishes a bot check — which clears on its own — from a hard
      * refusal like a removed video, which no amount of waiting will fix.
      */
-    suspend fun recordRefused(client: ExtractorClient, retryable: Boolean) = lock.withLock {
-        val state = stateFor(client.displayName)
+    suspend fun recordRefused(client: ExtractorClient, retryable: Boolean) = applyBlocking(client.displayName) { state ->
         state.score = (state.score - REFUSED_POINTS).coerceAtLeast(-20)
         state.consecutiveFailures++
         if (retryable) {
@@ -106,16 +119,28 @@ object ClientHealth {
     }
 
     /** Records that [client] answered but the stream it produced would not play. */
-    suspend fun recordBadStream(client: ExtractorClient) = lock.withLock {
-        val state = stateFor(client.displayName)
+    suspend fun recordBadStream(client: ExtractorClient) = applyBlocking(client.displayName) { state ->
         state.score = (state.score - BAD_STREAM_POINTS).coerceAtLeast(-20)
         state.consecutiveFailures++
         state.restedUntil = System.currentTimeMillis() + BAD_STREAM_REST_MS
         Log.d(TAG, "${client.displayName} produced an unplayable stream (score=${state.score})")
     }
 
+    /**
+     * Records that [client] answered but the stream it produced would not play.
+     * Blocking variant for the player's loading thread ([StreamResolvingDataSource]
+     * cannot suspend). Same bookkeeping as [recordBadStream], with its own guard so
+     * it never contends with a resolve holding the coroutine lock.
+     */
+    fun recordBadStreamBlocking(clientName: String) = applyBlocking(clientName) { state ->
+        state.score = (state.score - BAD_STREAM_POINTS).coerceAtLeast(-20)
+        state.consecutiveFailures++
+        state.restedUntil = System.currentTimeMillis() + BAD_STREAM_REST_MS
+        Log.d(TAG, "$clientName produced a capped/dead stream (score=${state.score})")
+    }
+
     /** Forgets everything, so the next play starts from the measured order again. */
-    suspend fun reset() = lock.withLock { states.clear() }
+    suspend fun reset() = synchronized(blockingGuard) { states.clear() }
 
     /**
      * Pays the token generator's cold cost before the first song needs it.

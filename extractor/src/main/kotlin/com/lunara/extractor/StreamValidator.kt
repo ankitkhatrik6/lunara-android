@@ -37,8 +37,11 @@ import java.util.concurrent.TimeUnit
  * - Everything past that is the player's problem to discover, and it is far better at
  *   it than a speculative probe made from a different connection.
  *
- * A caller that wants stronger evidence can ask [isDeeplyReadable] explicitly. It is
- * not used on the playback path, and that is the point.
+ * A caller that wants stronger evidence can ask [isDeeplyReadable] explicitly: the
+ * resolver uses it to hand the player a URL proven to serve data past the 1 MiB wall
+ * (a capped URL plays ~64s and then buffer-loops), and downloads use it to refuse a
+ * file that would be silently truncated. [isCapped] distinguishes a terminal refusal
+ * from an inconclusive probe for those callers.
  */
 object StreamValidator {
 
@@ -94,7 +97,11 @@ object StreamValidator {
      *
      * Exposed for diagnostics and for callers that genuinely want certainty — for
      * example when writing a file to disk, where a silent truncation would be worse
-     * than a failed download. It is deliberately not on the playback path.
+     * than a failed download. The resolver also uses it to prefer streams proven
+     * to play past ~64s (two 512 KiB chunks) over first-byte-only ones. An
+     * inconclusive probe (timeout, dropped connection) still returns true so a
+     * flaky network never rejects a working stream; use [isCapped] when a terminal
+     * refusal must be distinguished from inconclusive.
      */
     suspend fun isDeeplyReadable(stream: AudioStream): Boolean = withContext(Dispatchers.IO) {
         // A track shorter than the probe window has nothing past the boundary a player
@@ -104,6 +111,17 @@ object StreamValidator {
         }
         val start = GVS_THROTTLE_BYTES + DEEP_PROBE_BYTES
         probeCode(stream, start, DEEP_PROBE_BYTES) in ACCEPTED_CODES
+    }
+
+    /**
+     * True only when the CDN terminally refuses (401/403/410) past the 1 MiB throttle
+     * wall: the signature of a capped URL that plays ~64s and then buffer-loops.
+     * Timeouts and dropped connections return false — inconclusive, not capped.
+     */
+    suspend fun isCapped(stream: AudioStream): Boolean = withContext(Dispatchers.IO) {
+        if (stream.contentLength in 1..(GVS_THROTTLE_BYTES + DEEP_PROBE_BYTES)) return@withContext false
+        val start = GVS_THROTTLE_BYTES + DEEP_PROBE_BYTES
+        probeCode(stream, start, DEEP_PROBE_BYTES) in TERMINAL_CODES
     }
 
     /** A single ranged read of [length] bytes at [start], using the stream's own identity. */

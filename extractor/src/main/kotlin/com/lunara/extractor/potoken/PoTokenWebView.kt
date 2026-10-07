@@ -389,10 +389,6 @@ class PoTokenWebView private constructor(
     }.getOrElse { throw PoTokenException("Malformed BotGuard challenge", it) }
 
     /**
-     * Reads the integrity token and its lifetime out of the GenerateIT response.
-     *
-     * The token arrives as a JSON array of byte values, so it is rendered as a JS
-    /**
      * Parses the GenerateIT answer into a JS `Uint8Array`: `createPoTokenMinter`
      * passes it straight to BotGuard, which expects bytes and not a base64 string.
      *

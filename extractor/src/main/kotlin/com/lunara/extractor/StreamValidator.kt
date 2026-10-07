@@ -29,21 +29,18 @@ import java.util.concurrent.TimeUnit
  * ends up resolving nothing at all and showing "couldn't play this song" for a whole
  * library.
  *
- * So the rule here is deliberately narrow: **a first-byte failure rejects, a deep
- * failure does not.**
+ * So the rule here is now the simplest one Blazify has ever had: **the playback path
+ * probes nothing at all.** The resolver finalizes a URL and hands it over; the
+ * resolving data source discovers dead addresses where the evidence is real — the
+ * player's own connection — and heals in place. Probes remain here for callers that
+ * genuinely need certainty before committing (downloads, diagnostics): [isPlayable]
+ * for a cheap first-byte liveness check, [isDeeplyReadable] for proof past the
+ * throttle wall, and [isCapped] to tell a terminal refusal from an inconclusive one.
  *
- * - The first bytes are what ExoPlayer needs to even begin. If they will not come, the
- *   stream is dead and rejecting it saves the user a silent wait.
- * - Everything past that is the player's problem to discover, and it is far better at
- *   it than a speculative probe made from a different connection.
- *
- * A caller that wants stronger evidence can ask [isDeeplyReadable] explicitly —
- * downloads use it to refuse a file that would be silently truncated. The playback
- * path deliberately does not: a deep probe made from a different connection says
- * nothing reliable about the player's own, and rejecting on one is how a working
- * library turns into "buffers a few seconds, then never plays at all". [isCapped]
- * distinguishes a terminal refusal from an inconclusive probe for callers that need
- * to tell the difference.
+ * The history this encodes: a first-byte probe gate (v2.2.2) and a deep-probe veto
+ * (v2.2.3) each rejected streams the player would have read fine — the veto rejected
+ * *every* candidate and made the whole library unplayable — because a speculative
+ * probe made from a different connection is not evidence about the player's.
  */
 object StreamValidator {
 
@@ -63,10 +60,13 @@ object StreamValidator {
         .build()
 
     /**
-     * Whether [stream] can serve its first bytes to the player.
+     * Whether [stream] can serve its first bytes.
      *
-     * This is the only check the playback path performs, and it is intentionally a
-     * cheap one. See the class comment for why a deep probe must not gate playback.
+     * A cheap liveness probe for callers that want one — the playback path is NOT
+     * such a caller. Blazify resolves and hands the URL straight to the player, and
+     * copying that is what un-stuck playback: probe gates on a separate connection
+     * kept rejecting streams the player reads fine. A dead URL costs the resolving
+     * data source one in-place heal, which is where the real evidence lives.
      */
     suspend fun isPlayable(stream: AudioStream): Boolean = withContext(Dispatchers.IO) {
         // A stream whose URL has already expired is dead by definition and needs no

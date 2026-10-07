@@ -25,8 +25,11 @@ import kotlinx.coroutines.withTimeoutOrNull
  *     that do answer cap their media at 1 MiB. This runs first because it is the only
  *     step that unlocks everything else.
  *  2. Ask each client in health order. A rested client is still tried; only later.
- *  3. Take the first stream whose *first bytes* arrive. See [StreamValidator] for why
- *     that is the only check made here.
+ *  3. Hand the first finalized stream to the player **without probing it** — Blazify's
+ *     rule. A speculative probe on a separate connection is not evidence about the
+ *     player's, and gates built on one kept rejecting streams the player reads fine
+ *     (v2.2.2's first-byte check, v2.2.3's deep veto). Dead addresses are the data
+ *     source's problem, and it heals them in place where the evidence is real.
  *  4. If every client refused, renew the session identity once and try again. Every
  *     client failing together is a stale identity, not a broken track, and this is the
  *     difference between a library that mends itself and one somebody must reinstall.
@@ -148,6 +151,12 @@ object StreamResolver {
         // One token set serves every client: it is bound to the session, not to a
         // track, so re-minting per client would cost seconds for nothing.
         val tokens = PoTokenGenerator.tokensFor(videoId, visitorData)
+        // Without a token the media CDN serves the first megabyte and then refuses —
+        // the song that dies at ~64s. A single warning line turns the next bug report
+        // into a logcat that names the cause outright.
+        if (tokens == null) {
+            Log.w(TAG, "No PO token for $videoId — streams from this resolve may be capped at 1 MiB")
+        }
         // The stamp of the player this cipher will decipher with: a signature minted
         // against one player generation and unscrambled by another is refused by the
         // CDN, and that refusal reports nothing. The iframe-API reader — same page
@@ -177,8 +186,16 @@ object StreamResolver {
         return outcome
     }
 
-    /** Whole-resolve budget: token + rotation + probes must never hang the UI. */
+    /** Whole-resolve budget: token + rotation + cipher work must never hang the UI. */
     private const val RESOLVE_TIMEOUT_MS = 60_000L
+
+    /**
+     * Budget for a heal running on the loading thread. It sits inside a user's
+     * seek, so it is deliberately tight: a warm token WebView mints in well under a
+     * second and the player round trip is 1-3 s. Anything slower than this is a
+     * failure the player's retry policy should hear about quickly.
+     */
+    private const val FRESH_RESOLVE_TIMEOUT_MS = 15_000L
 
     /** One full pass over the client rotation. */
     private suspend fun resolveOnce(
@@ -220,26 +237,20 @@ object StreamResolver {
             }
 
             sawPlayable = true
-            // Blazify's rule, and this class's own: the first stream whose *first
-            // bytes* arrive is the stream. Nothing else gates a play. A speculative
-            // probe of a deep range on a separate connection is not evidence about
-            // the player's connection — gating on one (v2.2.3's `isCapped` veto)
-            // rejected streams the player would have read fine, and when every
-            // candidate was rejected resolve failed outright: "buffers a few
-            // seconds, then nothing ever plays". Mid-song deaths are handled where
-            // the evidence is real — the data source re-resolves a fresh URL and
-            // resumes in place at the exact byte.
-            // Candidates are finalized lazily so the common case (the first URL is
-            // good) pays for one cipher and one probe, not every format's cipher.
-            var sawAddress = false
+            // Blazify's exact rule: finalize the first usable format and hand it over.
+            // No speculative probe of any kind — a separate probe connection says
+            // nothing about the player's own (v2.2.2's first-byte probe and v2.2.3's
+            // deep veto both rejected streams the player would have read fine, and the
+            // veto made the whole library unplayable). A URL that turns out dead is
+            // the data source's job: it re-resolves in place and resumes at the exact
+            // byte, which is where the real evidence lives.
+            // Candidates are finalized lazily so the common case pays for one cipher,
+            // not every format's.
             for (candidate in selectCandidates(response.streams, quality)) {
                 if (candidate.isExpired) continue
                 // A raw format is not yet an address the CDN will serve: the cipher has
-                // to be unscrambled, the throttle solved and the streaming token attached
-                // before the probe below can mean anything.
+                // to be unscrambled, the throttle solved and the streaming token attached.
                 val stream = finalizeStream(candidate, client, videoId, tokens) ?: continue
-                sawAddress = true
-                if (!StreamValidator.isPlayable(stream)) continue
                 ClientHealth.recordSuccess(client)
                 Log.i(
                     TAG,
@@ -249,17 +260,12 @@ object StreamResolver {
                 return Outcome.Success(stream)
             }
 
-            // The client said OK and every URL it produced was refused on contact. That
-            // is worse than a refusal: the user waited for a stream that was never
-            // going to play.
+            // The client answered OK but produced no usable address at all (expired
+            // formats, every cipher unsolvable). Rest it and tell the cipher its player
+            // script may be behind — both mean "try something else next time".
             ClientHealth.recordBadStream(client)
-            if (sawAddress) {
-                // A whole client's worth of refusals may mean the config table is behind
-                // a player rotation. Rate-limited inside, fire-and-forget here: never
-                // worth stalling a resolve that is still working.
-                scope.launch { runCatching { CipherDeobfuscator.onStreamRejected() } }
-            }
-            Log.d(TAG, "${client.displayName} resolved but every URL it returned was refused")
+            scope.launch { runCatching { CipherDeobfuscator.onStreamRejected() } }
+            Log.d(TAG, "${client.displayName} produced no usable stream address")
         }
 
         return when {
@@ -410,8 +416,11 @@ object StreamResolver {
     /**
      * Resolves [videoId] on the player's loading thread, bypassing the cache.
      *
-     * The loading thread cannot suspend, so this runs a bounded blocking resolve.
-     * Used after a mid-song refusal (capped/expired URL): the cache is dropped first
+     * The loading thread cannot suspend, so this runs a bounded blocking resolve —
+     * [FRESH_RESOLVE_TIMEOUT_MS], tight because this budget sits inside a user's seek:
+     * with a warm token WebView the real cost is one player round trip (1-3 s), and a
+     * replacement that cannot be minted in time must fail into the player's retry
+     * policy quickly instead of leaving the UI spinning. The cache is dropped first
      * and the returned stream — if any — is stored, so the retry that follows heals
      * in place on a fresh URL instead of looping on the same dead one.
      */
@@ -419,7 +428,7 @@ object StreamResolver {
         invalidate(videoId)
         return try {
             kotlinx.coroutines.runBlocking {
-                kotlinx.coroutines.withTimeoutOrNull(25_000L) { resolveUncached(videoId) }
+                kotlinx.coroutines.withTimeoutOrNull(FRESH_RESOLVE_TIMEOUT_MS) { resolveUncached(videoId) }
             }?.let { outcome ->
                 when (outcome) {
                     is Outcome.Success -> {

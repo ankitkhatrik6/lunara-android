@@ -59,10 +59,9 @@ object ClientHealth {
 
     private val states = LinkedHashMap<String, State>()
     /**
-     * Guard for [recordBadStreamBlocking]: the loading thread and resolves touch the
-     * same client bookkeeping, but the loading thread cannot suspend, so it must never
-     * wait on a coroutine lock. All readers/writers of [states] go through
-     * [stateSnapshot]/[applyBlocking] below.
+     * Guard for [applyBlocking]: the loading thread and resolves touch the same
+     * client bookkeeping, and readers must never wait on a coroutine lock. All
+     * readers/writers of [states] go through [stateSnapshot]/[applyBlocking].
      */
     private val blockingGuard = Any()
 
@@ -124,19 +123,6 @@ object ClientHealth {
         state.consecutiveFailures++
         state.restedUntil = System.currentTimeMillis() + BAD_STREAM_REST_MS
         Log.d(TAG, "${client.displayName} produced an unplayable stream (score=${state.score})")
-    }
-
-    /**
-     * Records that [client] answered but the stream it produced would not play.
-     * Blocking variant for the player's loading thread ([StreamResolvingDataSource]
-     * cannot suspend). Same bookkeeping as [recordBadStream], with its own guard so
-     * it never contends with a resolve holding the coroutine lock.
-     */
-    fun recordBadStreamBlocking(clientName: String) = applyBlocking(clientName) { state ->
-        state.score = (state.score - BAD_STREAM_POINTS).coerceAtLeast(-20)
-        state.consecutiveFailures++
-        state.restedUntil = System.currentTimeMillis() + BAD_STREAM_REST_MS
-        Log.d(TAG, "$clientName produced a capped/dead stream (score=${state.score})")
     }
 
     /** Forgets everything, so the next play starts from the measured order again. */

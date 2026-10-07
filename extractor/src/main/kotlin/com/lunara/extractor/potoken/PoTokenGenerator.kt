@@ -25,8 +25,11 @@ import kotlinx.coroutines.withTimeout
  */
 object PoTokenGenerator {
 
-    /** A healthy mint takes well under a second; 8s leaves slack without stalling playback. */
-    private const val GENERATE_TIMEOUT_MS = 8_000L
+    /**
+     * A healthy mint takes well under a second; this covers one BotGuard cold start
+     * (2-5 s) that may be queued behind `prewarm` holding the lock, with slack.
+     */
+    private const val GENERATE_TIMEOUT_MS = 12_000L
 
     private val lock = Mutex()
 
@@ -101,10 +104,25 @@ object PoTokenGenerator {
      *
      * Rebuild conditions are checked in one place so a dead renderer is replaced before
      * the caller spends a timeout discovering it is gone.
+     *
+     * A *session change* deliberately does NOT rebuild. The BotGuard VM and its minter
+     * are not bound to a visitor id — the minter already signs arbitrary identifiers
+     * (video ids) — only the session token minted with it is, and that is re-minted
+     * below on the reused instance. The old behaviour closed the healthy WebView here
+     * whenever the session differed, so `prewarm`'s "warmup" instance was thrown away
+     * on the first real play and BotGuard's 2-5 s cold start was paid a second time
+     * inside [GENERATE_TIMEOUT_MS]. Losing that race returned null — no PO token — and
+     * an untokened stream is capped at 1 MiB: a song that dies at ~64 s. Blazify has
+     * no prewarm and so never paid twice; this removes the difference.
      */
     private suspend fun obtainWebView(session: String): PoTokenWebView {
         val existing = webView
-        if (existing != null && !existing.isDead && !existing.isExpired && sessionId == session) {
+        if (existing != null && !existing.isDead && !existing.isExpired) {
+            if (sessionId != session) {
+                sessionId = session
+                // Minted for the previous visitor; re-mint on the reused VM.
+                streamingToken = null
+            }
             return existing
         }
 

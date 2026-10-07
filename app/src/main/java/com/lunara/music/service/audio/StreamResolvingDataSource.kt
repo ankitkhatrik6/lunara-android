@@ -8,7 +8,6 @@ import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.TransferListener
 import com.lunara.extractor.AudioStream
-import com.lunara.extractor.ClientHealth
 import com.lunara.extractor.ResolveFailure
 import com.lunara.extractor.StreamResolver
 import kotlinx.coroutines.runBlocking
@@ -105,9 +104,6 @@ class StreamResolvingDataSource private constructor(
     /** Declared stream length when known; guards the capped-EOS heuristic at real EOF. */
     private var expectedEnd = -1L
 
-    /** Minting client of the current URL, so a capped/dead URL rests that client. */
-    private var lastClientName: String? = null
-
     /** One in-place recovery per open; a second failure belongs to the player's retry policy. */
     private var recoveredDuringRead = false
 
@@ -132,7 +128,6 @@ class StreamResolvingDataSource private constructor(
         var attempt = 0
         while (true) {
             val stream = resolveStream(id)
-            lastClientName = stream.clientName
             expectedEnd = stream.contentLength.takeIf { it > 0 } ?: -1L
             StreamHeaders.register(stream.url, stream.headers)
             try {
@@ -144,28 +139,35 @@ class StreamResolvingDataSource private constructor(
                 // A refusal means this URL is dead (expired, capped at 1 MiB, or the
                 // identity moved on); anything else is a connection that may yet work
                 // on a second try. Either way the retry is one bounded round trip.
-                // Rest the minting client on a refusal so the retry resolves through a
-                // different client instead of minting the same capped URL again.
                 if (e.isRefused()) {
                     Log.w(TAG, "CDN refused $id (${e.refusedCode()}); re-resolving", e)
+                    // Drop the dead URL — NOT the client. Blazify rests nothing from
+                    // playback: a position-based refusal (the 1 MiB wall) says nothing
+                    // about the minting client, and resting it for ten minutes pushed
+                    // every following song onto weaker fallbacks — the "every song
+                    // dies at 1:04" spiral. A fresh resolve gets a fresh address,
+                    // which is what actually changes the answer.
                     StreamResolver.invalidate(id)
-                    lastClientName?.let { ClientHealth.recordBadStreamBlocking(it) }
-                    StreamResolver.resolveFreshBlocking(id)?.let { fresh ->
-                        lastClientName = fresh.clientName
-                        expectedEnd = fresh.contentLength.takeIf { it > 0 } ?: -1L
-                        StreamHeaders.register(fresh.url, fresh.headers)
-                        try {
-                            val bytes = delegate.open(chunkSpecFor(dataSpec, fresh.url))
-                            chunkStart = dataSpec.position + dataSpec.uriPositionOffset
-                            chunkBytesRead = 0
-                            return bytes
-                        } catch (e2: IOException) {
-                            if (attempt < 1) {
-                                attempt += 1
-                                continue
-                            }
-                            throw e2
+                    val fresh = StreamResolver.resolveFreshBlocking(id)
+                        ?: throw IOException("The stream was refused. Check your connection and retry.")
+                    expectedEnd = fresh.contentLength.takeIf { it > 0 } ?: -1L
+                    StreamHeaders.register(fresh.url, fresh.headers)
+                    try {
+                        val bytes = delegate.open(chunkSpecFor(dataSpec, fresh.url))
+                        chunkStart = dataSpec.position + dataSpec.uriPositionOffset
+                        chunkBytesRead = 0
+                        return bytes
+                    } catch (e2: IOException) {
+                        // One minted replacement is the budget here; a second refusal
+                        // belongs to the player's retry policy, which re-resolves the
+                        // whole load. Failing fast is what keeps a forward-seek past a
+                        // dead region reading as a short error instead of the loading
+                        // thread hanging for tens of seconds with the UI spinning.
+                        if (attempt < 1) {
+                            attempt += 1
+                            continue
                         }
+                        throw e2
                     }
                 }
                 if (attempt < 1) {
@@ -198,11 +200,9 @@ class StreamResolvingDataSource private constructor(
                     val resumeAt = chunkStart + chunkBytesRead
                     Log.w(TAG, "Stream for $id ended early at byte $resumeAt; re-resolving")
                     StreamResolver.invalidate(id)
-                    lastClientName?.let { ClientHealth.recordBadStreamBlocking(it) }
                     runCatching { delegate.close() }
                     val fresh = StreamResolver.resolveFreshBlocking(id)
                         ?: throw IOException("The stream stopped early. Check your connection and retry.")
-                    lastClientName = fresh.clientName
                     expectedEnd = fresh.contentLength.takeIf { it > 0 } ?: -1L
                     StreamHeaders.register(fresh.url, fresh.headers)
                     val resumed = try {
@@ -237,10 +237,8 @@ class StreamResolvingDataSource private constructor(
 
             if (e.isRefused()) {
                 StreamResolver.invalidate(id)
-                lastClientName?.let { ClientHealth.recordBadStreamBlocking(it) }
             }
             val stream = resolveStream(id)
-            lastClientName = stream.clientName
             expectedEnd = stream.contentLength.takeIf { it > 0 } ?: -1L
             StreamHeaders.register(stream.url, stream.headers)
             reopenAt(spec, stream.url, resumeAt)
@@ -282,7 +280,6 @@ class StreamResolvingDataSource private constructor(
             chunkStart = 0L
             chunkBytesRead = 0L
             expectedEnd = -1L
-            lastClientName = null
             recoveredDuringRead = false
         }
     }

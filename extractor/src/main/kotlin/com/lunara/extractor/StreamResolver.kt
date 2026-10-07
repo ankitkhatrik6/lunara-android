@@ -307,8 +307,7 @@ object StreamResolver {
      * Turns one raw format into the address the CDN will actually serve.
      *
      * Three things stand between what `/player` handed back and a URL that plays, and
-     * order matters — the probe in [resolveOnce] must see the finished address or it
-     * validates the wrong thing:
+     * order matters:
      *
      *  1. A signature cipher is unscrambled through the site's own player script.
      *     Bounded, because a player shape the cipher cannot read never finishes, and

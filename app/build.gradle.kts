@@ -33,8 +33,8 @@ android {
     // Increment versionCode for every published update. A stable applicationId,
     // a stable signing key and a strictly increasing versionCode together are
     // what allow an APK to be installed over a previous build.
-    versionCode = 13
-    versionName = "2.2.5"
+    versionCode = 14
+    versionName = "2.2.6"
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 

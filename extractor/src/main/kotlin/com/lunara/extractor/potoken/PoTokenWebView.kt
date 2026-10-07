@@ -298,7 +298,14 @@ class PoTokenWebView private constructor(
                 .filter { it.isNotBlank() }
                 .map { it.trim().toInt().toByte() }
                 .toByteArray()
+            // Blazify's exact output (`u8ToBase64`): standard base64, then converted
+            // to the URL-safe alphabet. The media CDN reads `pot=` in url-safe form —
+            // sending `+`/`/` made the token decode to garbage there, which the server
+            // treats exactly like having no token at all: the first megabyte plays and
+            // the stream dies at ~1:02.
             Base64.encodeToString(bytes, Base64.NO_WRAP)
+                .replace("+", "-")
+                .replace("/", "_")
         }.getOrElse {
             pending.remove(key)?.resumeWithException(PoTokenException("Malformed token bytes", it))
             return
@@ -385,16 +392,39 @@ class PoTokenWebView private constructor(
      * Reads the integrity token and its lifetime out of the GenerateIT response.
      *
      * The token arrives as a JSON array of byte values, so it is rendered as a JS
-     * `Uint8Array`: `createPoTokenMinter` passes it straight to BotGuard, which expects
-     * bytes and not a base64 string.
+    /**
+     * Parses the GenerateIT answer into a JS `Uint8Array`: `createPoTokenMinter`
+     * passes it straight to BotGuard, which expects bytes and not a base64 string.
+     *
+     * The response shape is `[ "<base64 integrity token>", ttlSeconds ]` — element 0
+     * is a base64 **string**, exactly as Blazify parses it (`parseIntegrityTokenData`
+     * + `base64ToByteString` in JavaScriptUtil). This function used to demand a JSON
+     * array of byte integers instead, got null for the real response, and threw on
+     * every attempt: no minter, no PO token, and every stream the CDN served arrived
+     * capped at 1 MiB — the song that stops at ~1:02 and the forward-seek that never
+     * comes back. Both shapes are accepted below so either answer parses, but the
+     * string form is the one the endpoint actually sends.
      */
     private fun parseIntegrityToken(body: String): Pair<String, Long> = runCatching {
         val array = JSONArray(body)
         val ttlSeconds = array.optLong(1, DEFAULT_TTL_SECONDS)
-        val bytesJson = array.optJSONArray(0) ?: throw PoTokenException("No integrity token")
-        val bytes = ByteArray(bytesJson.length()) { bytesJson.getInt(it).toByte() }
-        toJsUint8Array(bytes) to ttlSeconds
+        val tokenBytes = when (val first = array.opt(0)) {
+            is JSONArray -> ByteArray(first.length()) { first.getInt(it).toByte() }
+            is String -> decodeYouTubeBase64(first)
+            else -> throw PoTokenException("No integrity token")
+        }
+        toJsUint8Array(tokenBytes) to ttlSeconds
     }.getOrElse { throw PoTokenException("Malformed integrity token", it) }
+
+    /**
+     * Decodes YouTube's base64 dialect: the url-safe alphabet (`-`, `_`) with `.`
+     * standing in for `=` padding — the same normalisation Blazify's
+     * `base64ToByteString` applies before every decode.
+     */
+    private fun decodeYouTubeBase64(value: String): ByteArray {
+        val normalized = value.replace('-', '+').replace('_', '/').replace('.', '=')
+        return Base64.decode(normalized, Base64.DEFAULT)
+    }
 
     /** Renders [value] as a JavaScript `Uint8Array`, which is how BotGuard takes input. */
     private fun toJsUint8Array(value: String): String =

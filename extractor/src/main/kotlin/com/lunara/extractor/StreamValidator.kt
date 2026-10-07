@@ -37,11 +37,13 @@ import java.util.concurrent.TimeUnit
  * - Everything past that is the player's problem to discover, and it is far better at
  *   it than a speculative probe made from a different connection.
  *
- * A caller that wants stronger evidence can ask [isDeeplyReadable] explicitly: the
- * resolver uses it to hand the player a URL proven to serve data past the 1 MiB wall
- * (a capped URL plays ~64s and then buffer-loops), and downloads use it to refuse a
- * file that would be silently truncated. [isCapped] distinguishes a terminal refusal
- * from an inconclusive probe for those callers.
+ * A caller that wants stronger evidence can ask [isDeeplyReadable] explicitly —
+ * downloads use it to refuse a file that would be silently truncated. The playback
+ * path deliberately does not: a deep probe made from a different connection says
+ * nothing reliable about the player's own, and rejecting on one is how a working
+ * library turns into "buffers a few seconds, then never plays at all". [isCapped]
+ * distinguishes a terminal refusal from an inconclusive probe for callers that need
+ * to tell the difference.
  */
 object StreamValidator {
 
@@ -92,16 +94,16 @@ object StreamValidator {
         }
     }
 
-    /**
+     /**
      * Whether [stream] can serve data from well past the throttle boundary.
      *
-     * Exposed for diagnostics and for callers that genuinely want certainty — for
-     * example when writing a file to disk, where a silent truncation would be worse
-     * than a failed download. The resolver also uses it to prefer streams proven
-     * to play past ~64s (two 512 KiB chunks) over first-byte-only ones. An
-     * inconclusive probe (timeout, dropped connection) still returns true so a
-     * flaky network never rejects a working stream; use [isCapped] when a terminal
-     * refusal must be distinguished from inconclusive.
+     * Exposed for callers that genuinely want certainty — for example when writing a
+     * file to disk, where a silent truncation would be worse than a failed download.
+     * It is deliberately not on the playback path: the probe runs on a separate
+     * connection from the player's, so a refusal here is not proof the player would
+     * be refused, and a false rejection means a song that never starts. An
+     * inconclusive probe (timeout, dropped connection) returns true; use [isCapped]
+     * when a terminal refusal must be distinguished from inconclusive.
      */
     suspend fun isDeeplyReadable(stream: AudioStream): Boolean = withContext(Dispatchers.IO) {
         // A track shorter than the probe window has nothing past the boundary a player

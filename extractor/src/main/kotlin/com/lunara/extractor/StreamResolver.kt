@@ -220,13 +220,18 @@ object StreamResolver {
             }
 
             sawPlayable = true
-            // Prefer a stream proven to serve data past the 1 MiB throttle wall: a
-            // first-byte-only URL plays ~64s (two 512 KiB chunks) and then buffer-loops
-            // on the third chunk — the "stops at 1:04" failure. Candidates are finalized
-            // lazily so the common case (the first URL is good) pays for one cipher and
-            // two probes, not every format's cipher.
+            // Blazify's rule, and this class's own: the first stream whose *first
+            // bytes* arrive is the stream. Nothing else gates a play. A speculative
+            // probe of a deep range on a separate connection is not evidence about
+            // the player's connection — gating on one (v2.2.3's `isCapped` veto)
+            // rejected streams the player would have read fine, and when every
+            // candidate was rejected resolve failed outright: "buffers a few
+            // seconds, then nothing ever plays". Mid-song deaths are handled where
+            // the evidence is real — the data source re-resolves a fresh URL and
+            // resumes in place at the exact byte.
+            // Candidates are finalized lazily so the common case (the first URL is
+            // good) pays for one cipher and one probe, not every format's cipher.
             var sawAddress = false
-            var shallowFallback: AudioStream? = null
             for (candidate in selectCandidates(response.streams, quality)) {
                 if (candidate.isExpired) continue
                 // A raw format is not yet an address the CDN will serve: the cipher has
@@ -235,30 +240,13 @@ object StreamResolver {
                 val stream = finalizeStream(candidate, client, videoId, tokens) ?: continue
                 sawAddress = true
                 if (!StreamValidator.isPlayable(stream)) continue
-                if (StreamValidator.isDeeplyReadable(stream)) {
-                    ClientHealth.recordSuccess(client)
-                    Log.i(
-                        TAG,
-                        "Resolved $videoId via ${client.displayName}: " +
-                            "${stream.bitrate / 1000} kbps ${stream.containerMimeType} (deep)",
-                    )
-                    return Outcome.Success(stream)
-                }
-                // Inconclusive deep probe (timeout/dropped second connection) must not
-                // reject a stream the first-byte check accepted — but a terminal 403/410
-                // past the throttle wall is a capped URL and is never a fallback.
-                if (shallowFallback == null && !StreamValidator.isCapped(stream)) {
-                    shallowFallback = stream
-                }
-            }
-            if (shallowFallback != null) {
                 ClientHealth.recordSuccess(client)
                 Log.i(
                     TAG,
                     "Resolved $videoId via ${client.displayName}: " +
-                        "${shallowFallback.bitrate / 1000} kbps ${shallowFallback.containerMimeType}",
+                        "${stream.bitrate / 1000} kbps ${stream.containerMimeType}",
                 )
-                return Outcome.Success(shallowFallback)
+                return Outcome.Success(stream)
             }
 
             // The client said OK and every URL it produced was refused on contact. That

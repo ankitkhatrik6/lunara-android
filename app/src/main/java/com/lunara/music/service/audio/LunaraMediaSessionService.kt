@@ -8,6 +8,7 @@ import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.extractor.DefaultExtractorsFactory
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
@@ -67,8 +68,17 @@ class LunaraMediaSessionService : MediaSessionService() {
         // The resolving layer sits *above* DefaultDataSource so it can turn a
         // schemeless video id into an http URL (and local content:// / file URIs
         // pass straight through it untouched).
+        //
+        // The extractor set mirrors Blazify's `createMediaSourceFactory`: every
+        // extractor, plus constant-bitrate seeking. A stream whose container says
+        // little about its own index still seeks (this is what turns a tap on the
+        // progress bar into music instead of a stalled player), and the cost is a
+        // few sniffs on a local file.
         val mediaSourceFactory =
-            DefaultMediaSourceFactory(StreamResolvingDataSource.Factory(dataSourceFactory))
+            DefaultMediaSourceFactory(
+                StreamResolvingDataSource.Factory(dataSourceFactory),
+                DefaultExtractorsFactory().setConstantBitrateSeekingEnabled(true),
+            )
 
         // Buffer like Blazify: enough ahead that an ordinary drop in signal passes
         // unheard, quick enough to start that the first note is not a wait.

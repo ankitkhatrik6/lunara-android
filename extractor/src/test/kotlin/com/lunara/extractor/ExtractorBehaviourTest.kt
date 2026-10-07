@@ -1,5 +1,6 @@
 package com.lunara.extractor
 
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -197,6 +198,32 @@ class ExtractorBehaviourTest {
         assertTrue(context.contains("\\\"evil\\\""))
         assertFalse(context.contains("\"evil\":\"1\""))
     }
+
+    //endregion
+
+    //region Client health
+
+    /**
+     * A rested client must stay in the rotation.
+     *
+     * The mid-song heal rests the minting client whenever a URL dies on contact. If
+     * resting *removed* clients, a network where streams die often would rest every
+     * client in turn and the next resolve would have nobody to ask — a resolve that
+     * fails outright is the "buffers a few seconds, then never starts" failure. The
+     * order changes with health; the membership never does.
+     */
+    @Test
+    fun `rested clients stay in the rotation so a resolve always has someone to ask`() =
+        runBlocking {
+            val all = ClientRegistry.rotation()
+            try {
+                all.forEach { ClientHealth.recordBadStream(it) }
+                ClientHealth.recordRefused(ClientRegistry.MAIN_CLIENT, retryable = true)
+                assertEquals(all.toSet(), ClientHealth.ordered().toSet())
+            } finally {
+                ClientHealth.reset()
+            }
+        }
 
     //endregion
 

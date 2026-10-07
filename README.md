@@ -121,8 +121,8 @@ Measured against the live API while building this:
 | Resolves fine, then buffers forever | Media capped at exactly 1 MiB; Media3 reads the first megabyte, asks for more, gets `403` | Mint a BotGuard PO token first, so the CDN serves the whole file |
 | `LOGIN_REQUIRED` on every track | The request presented an identity the catalogue has stopped recognising | Visitor identity is minted per session and **renewed automatically** when every client refuses at once |
 | Sixteen seconds before anything plays | Every play tried five clients, four of which cannot ever work | Client health scoring tries the working one first and rests the rest |
-| Nothing plays at all | The validator deep-probed past the 1 MiB boundary, saw the `403` every capped stream returns, and discarded **working** streams | A first-byte failure rejects a stream and an inconclusive deep probe lets it play; only a terminal `403` past the 1 MiB wall rejects it, because that URL would die at ~64 s |
-| Buffers a few seconds, pauses, repeats forever | The player held one long-lived googlevideo connection; when the CDN capped, expired or dropped it mid-song, playback restarted from zero and hit the same wall again | The player is never handed a URL: a resolving data source resolves the video id **at every load**, caps each load at 512 KiB, and swaps in a fresh URL in place — a dead address costs one chunk, never the song. Resolution also **prefers a stream proven to serve data past the 1 MiB wall**, so the capped URL that plays ~64 s and then loops is rejected before the player ever sees it |
+| Nothing plays at all | A speculative probe of a deep byte range — made on a *different connection* from the player's — saw a `403` and vetoed streams the player would have read fine; with every candidate rejected, resolve failed after a few seconds of buffering | Playback gates on **first bytes only**, Blazify's exact rule: a stream is handed to the player unless its very first range is refused. Deep probes are reserved for downloads, where a silent truncation really matters |
+| Buffers a few seconds, pauses, repeats forever | The player held one long-lived googlevideo connection; when the CDN capped, expired or dropped it mid-song, playback restarted from zero and hit the same wall again | The player is never handed a URL: a resolving data source resolves the video id **at every load**, caps each load at 512 KiB, and swaps in a fresh URL in place — a dead address costs one chunk, never the song. If a URL dies mid-song anyway, the cache is dropped first and the stream **re-resolves fresh, resuming at the exact byte offset**, so the retry cannot loop on the same dead address |
 
 ## Technology Stack
 
@@ -130,7 +130,7 @@ Measured against the live API while building this:
 |------|--------|
 | Platform | Android, Kotlin, Jetpack Compose, Material 3 |
 | Audio | AndroidX Media3 (ExoPlayer and MediaSession) with an OkHttp data source behind a Blazify-style resolving data source: request-time stream resolution in 512 KiB chunks with in-place URL refresh |
-| Extraction | In-app InnerTube client (player endpoint, client rotation, signature + `n` throttling decipher) and deep stream validation |
+| Extraction | In-app InnerTube client (player endpoint, client rotation, signature + `n` throttling decipher) and first-byte stream validation, with deep probes reserved for downloads |
 | Lyrics | Paxsenix, LRCLIB, Better Lyrics, KuGou, and LyricsPlus |
 | Database | AndroidX Room |
 | Images | Coil |

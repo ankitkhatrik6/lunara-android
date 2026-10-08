@@ -425,7 +425,7 @@ object StreamResolver {
                     // front of the encoded token value. A bare "<token>=<token>" (the
                     // token acting as its own parameter name) is what serves the first
                     // megabyte and then 403s, which stops playback at ~1:04.
-                    url = "$url$separatorpot=${Uri.encode(pot)}"
+                    url = "$url$separator pot=${Uri.encode(pot)}"
                 }
         }
 

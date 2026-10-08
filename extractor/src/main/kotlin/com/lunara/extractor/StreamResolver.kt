@@ -421,7 +421,11 @@ object StreamResolver {
                 ?.takeIf { it.isNotBlank() && "pot=" !in url }
                 ?.let { pot ->
                     val separator = if ('?' in url) '&' else '?'
-                    url = "$url$separator$pot=${Uri.encode(pot)}"
+                    // Blazify's exact rule: the parameter name is literally "pot", in
+                    // front of the encoded token value. A bare "<token>=<token>" (the
+                    // token acting as its own parameter name) is what serves the first
+                    // megabyte and then 403s, which stops playback at ~1:04.
+                    url = "$url$separatorpot=${Uri.encode(pot)}"
                 }
         }
 

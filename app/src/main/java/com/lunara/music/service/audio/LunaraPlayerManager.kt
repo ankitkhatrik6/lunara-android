@@ -790,8 +790,4 @@ object LunaraPlayerManager {
  * would only clip on phones that are already loud. Null loudness (no figure
  * reported, a local file) and a disabled setting both mean unity.
  */
-internal fun normalizationGainFor(loudnessDb: Double?, enabled: Boolean): Float {
-    if (!enabled || loudnessDb == null) return 1f
-    val gain = 10.0.pow(-loudnessDb / 20.0)
-    return minOf(gain, 1.0).toFloat()
-}
+

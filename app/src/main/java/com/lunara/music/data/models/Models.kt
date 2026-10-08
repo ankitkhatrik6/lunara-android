@@ -146,6 +146,22 @@ fun streamQualityFor(setting: String?): StreamQuality = when {
     else -> StreamQuality.NORMAL
 }
 
+/** The volume factor for one song under the Volume normalization setting.
+
+ * InnerTune's exact rule, kept because it is measured against the same figure
+ * YouTube reports: a track whose [loudnessDb] is above the target is attenuated by
+ * that many decibels, and a track at or below it plays at unity — quiet songs are
+ * never boosted, because boosting gain a quiet master was mixed that way on purpose
+ * would only clip on phones that are already loud. Null loudness (no figure
+ * reported, a local file) and a disabled setting both mean unity.
+ */
+
+fun normalizationGainFor(loudnessDb: Double?, enabled: Boolean): Float {
+    if (!enabled || loudnessDb == null) return 1f
+    val gain = 10.0.pow(-loudnessDb / 20.0)
+    return minOf(gain, 1.0).toFloat()
+}
+
 data class BrowseCategory(
     val id: String,
     val title: String,

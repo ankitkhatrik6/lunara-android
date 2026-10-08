@@ -510,6 +510,7 @@ object StreamResolver {
     fun clear() {
         synchronized(cache) { cache.clear() }
         scope.launch { ClientHealth.reset() }
+    }
 
     /**
      * Re-encodes a base64 token for use in a URL parameter.

@@ -46,6 +46,15 @@ object LunaraPlayerManager {
 
     private const val TAG = "LunaraPlayerManager"
 
+    /** A silent stretch this long means the stream died; re-resolve in place. */
+    private const val STALL_TIMEOUT_MS = 5_000L
+
+    /** The blocking re-resolve budget inside one stall recovery. */
+    private const val RECOVER_TIMEOUT_MS = 8_000L
+
+    /** Restarts past this many leave the song with a clear error instead of looping. */
+    private const val MAX_STALL_RECOVERIES = 3
+
     // --- public state ---------------------------------------------------
 
     private val _currentSong = MutableStateFlow<Song?>(null)
@@ -91,6 +100,11 @@ object LunaraPlayerManager {
     private var loadJob: Job? = null
     private var stallRecoveryCount = 0
     private var stallRecovered = false
+
+    /** Last observed position/buffer marks, so a silent buffer is detectable. */
+    private var lastPosition = -1L
+    private var lastBuffered = -1L
+    private var lastProgressAt = 0L
 
     private var prefetchJob: Job? = null
 
@@ -310,10 +324,8 @@ object LunaraPlayerManager {
             _queueIndex.value = -1
         }
     }
-}
 
-
-    private fun resumeFromStall(videoId: String, positionMs: Long) {
+    private suspend fun resumeFromStall(videoId: String, positionMs: Long) {
         val canRecover = try {
             withTimeout(RECOVER_TIMEOUT_MS) {
                 val outcome = StreamResolver.resolve(videoId)
@@ -364,10 +376,6 @@ object LunaraPlayerManager {
 
         streamFailed(videoId)
         pause()
-        if (stallRecoveryCount < MAX_SONG_RETRIES) {
-            // Give the queue one more chance to advance while the player prepares
-            // a fresh data source.
-        }
     }
 
     private fun streamFailed(videoId: String) {
@@ -430,7 +438,8 @@ object LunaraPlayerManager {
         }
     }
 
-
+    private fun setupPlayerListener() {
+        exoPlayer?.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
                 if (playing && _isPlaying.value != true) {
                     _isPlaying.value = true
@@ -442,6 +451,31 @@ object LunaraPlayerManager {
 
             override fun onPlaybackParametersChanged(parameters: Player.PlaybackParameters) {
                 // No-op: media3 reports these every frame otherwise.
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                when (playbackState) {
+                    Player.STATE_BUFFERING -> {
+                        _isBuffering.value = true
+                        _playbackError.value = null
+                    }
+                    Player.STATE_READY -> {
+                        _isBuffering.value = false
+                        _playbackError.value = null
+                        // Ready means data flowed: the recovery allowance is
+                        // per-failure, not per-song, so a track that plays and
+                        // later stumbles still gets its full budget.
+                        stallRecoveryCount = 0
+                        _durationMs.value = exoPlayer?.duration?.coerceAtLeast(0L) ?: 0L
+                    }
+                    Player.STATE_ENDED -> {
+                        _isBuffering.value = false
+                        handleSongEnded()
+                    }
+                    Player.STATE_IDLE -> {
+                        _isBuffering.value = false
+                    }
+                }
             }
 
             override fun onPlayerError(error: PlaybackException) {
@@ -521,24 +555,30 @@ object LunaraPlayerManager {
                         player.pause()
                         return
                     }
-                    resumeFromStall(currentMediaUri ?: return@launch, position)
+                    val stalledUri = currentMediaUri ?: return
+                    scope.launch { resumeFromStall(stalledUri, position) }
                     return
                 }
 
-                val needsClear = error.errorCode == PlaybackException.ERROR_CODE_IO &&
-                        (error.baseCode == PlaybackException.ERROR_CODE_IO_DEVICE ||
-                                error.baseCode == PlaybackException.ERROR_CODE_IO_UNKNOWN ||
-                                error.baseCode == PlaybackException.ERROR_CODE_IO_SOCKET)
-
-                val retry = error.errorCode == PlaybackException.ERROR_CODE_IO &&
-                        !bufferStill && error.baseCode != PlaybackException.ERROR_CODE_IO_DEVICE &&
-                        error.baseCode != PlaybackException.ERROR_CODE_IO_SOCKET
-
-                if (needsClear || retry) {
+                // Any I/O failure puts the address in doubt. Drop it and
+                // re-resolve in place: the buffer still holds what the listener
+                // is hearing, so the retry cannot loop on the same dead address.
+                val isIoFailure = error.errorCode in setOf(
+                    PlaybackException.ERROR_CODE_IO_UNSPECIFIED,
+                    PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
+                    PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
+                    PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE,
+                    PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
+                    PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
+                    PlaybackException.ERROR_CODE_IO_NO_PERMISSION,
+                    PlaybackException.ERROR_CODE_IO_CLEARTEXT_NOT_PERMITTED,
+                    PlaybackException.ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE,
+                )
+                if (isIoFailure) {
                     val videoId = currentMediaUri ?: return
                     streamFailed(videoId)
                     pause()
-                    resumeFromStall(videoId, position)
+                    scope.launch { resumeFromStall(videoId, position) }
                     return
                 }
 
@@ -730,7 +770,5 @@ object LunaraPlayerManager {
             }
         }
     }
-}
-
 }
 

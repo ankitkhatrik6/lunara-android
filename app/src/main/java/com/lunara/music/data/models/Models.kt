@@ -1,5 +1,6 @@
 package com.lunara.music.data.models
 
+import com.lunara.extractor.StreamQuality
 import com.lunara.music.database.SongEntity
 
 data class Song(
@@ -125,6 +126,24 @@ enum class AudioQuality(val title: String, val bitrate: String) {
     LOW("Data Saver", "64 kbps"),
     NORMAL("Normal", "128 kbps"),
     HIGH("High Quality", "256 kbps")
+}
+
+/**
+ * Maps the stored Audio Quality setting to the extractor's stream selection.
+ *
+ * The settings dialog writes human-readable labels ("Normal (128 kbps)"); this is
+ * the one place that turns them into something the resolver acts on, so the label
+ * on screen and the bytes on the wire cannot drift apart. An unknown or missing
+ * value reads as NORMAL because that is the label the dialog shows when nothing
+ * has been chosen yet — a setting that says one thing while playback does another
+ * is worse than a boring default.
+ */
+fun streamQualityFor(setting: String?): StreamQuality = when {
+    setting.isNullOrBlank() -> StreamQuality.NORMAL
+    setting.startsWith("Data Saver") -> StreamQuality.LOW
+    setting.startsWith("High") -> StreamQuality.HIGH
+    setting.startsWith("Normal") -> StreamQuality.NORMAL
+    else -> StreamQuality.NORMAL
 }
 
 data class BrowseCategory(

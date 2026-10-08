@@ -159,6 +159,15 @@ object InnerTubePlayerApi {
         streamingData.optJSONArray("formats")?.let { collect(it, formats) }
 
         val headers = client.mediaHeaders(visitorData)
+
+        // `playerConfig.audioConfig.loudnessDb` describes the video, not the format, so
+        // it is read once here and attached to every candidate. A missing figure is a
+        // normal answer — clients differ in whether they include it — and simply means
+        // the player will not adjust volume for this track.
+        val loudnessDb = root.optJSONObject("playerConfig")
+            ?.optJSONObject("audioConfig")
+            ?.optDouble("loudnessDb")
+            ?.takeIf { !it.isNaN() }
         // `streamingData` carries an explicit lifetime. Guessing a fixed one when it is
         // absent means handing out a URL that outlives its own validity.
         val declaredExpiryMs = streamingData.optLong("expiresInSeconds")
@@ -195,6 +204,7 @@ object InnerTubePlayerApi {
                     audioChannels = format.optInt("audioChannels").coerceAtLeast(2),
                     isLiveStream = isLive,
                     signatureCipher = cipher,
+                    loudnessDb = loudnessDb,
                 ).withSafeLifetime()
             }
             .sortedWith(streamPreference)

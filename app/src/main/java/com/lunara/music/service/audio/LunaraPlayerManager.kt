@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
+import kotlin.math.pow
 
 object LunaraPlayerManager {
     private const val TAG = "LunaraPlayerManager"
@@ -62,6 +63,27 @@ object LunaraPlayerManager {
     val playbackError: StateFlow<String?> = _playbackError.asStateFlow()
 
     private var songRetryCount = 0
+
+    /**
+     * Whether loudness normalization is on.
+     *
+     * Written by the settings screen through [setNormalizationEnabled], read on the
+     * player's thread when volume is applied. Volatile because the two sides live on
+     * different threads and a stale `true` here would quietly undo the toggle.
+     */
+    @Volatile
+    private var normalizationEnabled = true
+
+    /**
+     * The loudness figure of the song currently loaded, or null when there is none
+     * (a local file, or a client that did not report one). Volatile for the same
+     * reason as [normalizationEnabled]: set during the resolve, applied on Main.
+     */
+    @Volatile
+    private var currentLoudnessDb: Double? = null
+
+    /** The in-flight prefetch of upcoming queue items; replaced on every new load. */
+    private var prefetchJob: Job? = null
 
     // NOTE: cannot be a companion object — this is an `object`, not a class.
     private const val MAX_SONG_RETRIES = 3
@@ -118,6 +140,27 @@ object LunaraPlayerManager {
     }
 
     fun getPlayer(): ExoPlayer? = exoPlayer
+
+    /**
+     * Applies the Volume normalization setting.
+     *
+     * Called from the settings screen; the player itself lives on the main thread,
+     * so the volume write hops there through the manager's scope.
+     */
+    fun setNormalizationEnabled(enabled: Boolean) {
+        normalizationEnabled = enabled
+        scope.launch { applyPlayerVolume() }
+    }
+
+    /**
+     * Sets the player's volume for the current song.
+     *
+     * Kept in one place so every path that can change what is playing — a fresh load,
+     * a stall reconnect, a settings toggle — reaches the same decision.
+     */
+    private fun applyPlayerVolume() {
+        exoPlayer?.volume = normalizationGainFor(currentLoudnessDb, normalizationEnabled)
+    }
 
     internal fun attachPlayer(player: ExoPlayer, context: Context) {
         exoPlayer = player
@@ -391,12 +434,17 @@ object LunaraPlayerManager {
         // the (single) main-thread scope — that pile-up is what froze the UI
         // into "Lunara isn't responding". Only the latest tap keeps running.
         loadJob?.cancel()
+        // The prefetch belongs to the queue as it was; a new load supersedes it.
+        prefetchJob?.cancel()
         loadJob = scope.launch(Dispatchers.IO) {
             // 1. A downloaded file on disk always wins.
             val localFile = song.localFilePath
                 ?.takeIf { it.isNotBlank() }
                 ?.let { path -> File(path).takeIf { it.exists() && it.length() > 0 } }
             if (localFile != null) {
+                // A file on the phone carries no loudness figure; volume goes back to
+                // unity so the previous track's normalization cannot leak into it.
+                currentLoudnessDb = null
                 withContext(Dispatchers.Main) {
                     playMediaUri(
                         song,
@@ -417,6 +465,7 @@ object LunaraPlayerManager {
             //    media scanner is a stable, reusable value.
             val persisted = song.streamUrl?.takeIf { it.startsWith("content://") }
             if (persisted != null) {
+                currentLoudnessDb = null
                 withContext(Dispatchers.Main) {
                     playMediaUri(song, persisted, resumePositionMs = resumeFromMs)
                 }
@@ -459,6 +508,15 @@ object LunaraPlayerManager {
             // Bind the minting identity to this URL so the data source sends the
             // matching User-Agent / Referer on every range request.
             StreamHeaders.register(stream.url, stream.headers)
+
+            // Loudness travels with the stream; the player applies it as a volume
+            // factor when the item is prepared (see normalizationGainFor).
+            currentLoudnessDb = stream.loudnessDb
+
+            // Warm the next queue items now that this one is away. The tap on "next"
+            // then finds a stream already resolved instead of paying the token mint
+            // and player round trip while the UI waits.
+            prefetchUpcoming()
 
             // The player is handed the *video id*, not the URL. From here on the
             // resolving data source owns the address: it resolves at every load,
@@ -515,6 +573,9 @@ object LunaraPlayerManager {
         player.setMediaItem(mediaItem)
         player.prepare()
         if (resumePositionMs > 0L) player.seekTo(resumePositionMs)
+        // Volume for this song (loudness normalization), applied on the player's own
+        // thread — covering fresh loads and stall reconnects alike.
+        applyPlayerVolume()
         // playWhenReady=true fires onPlayWhenReadyChanged, which is the single
         // writer of the play/pause affordance — no manual _isPlaying write here.
         player.playWhenReady = true
@@ -522,6 +583,38 @@ object LunaraPlayerManager {
         // Watch from the moment the item is prepared: a truncated stream will sit
         // in STATE_BUFFERING forever without ever reaching isPlaying.
         startPositionTracker()
+    }
+
+    /**
+     * Warms the streams of the next few queue items in the background.
+     *
+     * Lunara hands the player one media item at a time, so ExoPlayer's own playlist
+     * prefetch — what quietly prepares the next song in InnerTune and Blazify —
+     * never runs here. Resolving ahead from the other side is the same benefit: the
+     * tap on "next" finds the stream already in [StreamResolver]'s cache instead of
+     * waiting out a BotGuard mint and a player round trip. Bounded to the two items
+     * after the current one, and replaced whenever a newer load starts.
+     */
+    private fun prefetchUpcoming() {
+        val index = _queueIndex.value
+        if (index < 0) return
+        val queue = _queue.value
+        val upcoming =
+            (index + 1 until minOf(index + 3, queue.size)).mapNotNull { queue.getOrNull(it) }
+        if (upcoming.isEmpty()) return
+        prefetchJob?.cancel()
+        prefetchJob = scope.launch(Dispatchers.IO) {
+            for (next in upcoming) {
+                // A file on the phone needs no extraction, and a scanner's content://
+                // URI is stable — only catalogue tracks go through the resolver.
+                val local = next.localFilePath?.takeIf { it.isNotBlank() }?.let { File(it) }
+                if (local != null && local.exists()) continue
+                if (next.streamUrl?.startsWith("content://") == true) continue
+                // Already-cached entries return instantly; a miss mints once and stores
+                // the result — headers included — for the play that follows.
+                runCatching { StreamResolver.resolve(next.id) }
+            }
+        }
     }
 
     fun togglePlayPause() {
@@ -685,4 +778,20 @@ object LunaraPlayerManager {
             _queueIndex.value = -1
         }
     }
+}
+
+/**
+ * The volume factor for one song under the Volume normalization setting.
+ *
+ * InnerTune's exact rule, kept because it is measured against the same figure
+ * YouTube reports: a track whose `loudnessDb` is above the target is attenuated by
+ * that many decibels, and a track at or below it plays at unity — quiet songs are
+ * never boosted, because boosting gain a quiet master was mixed that way on purpose
+ * would only clip on phones that are already loud. Null loudness (no figure
+ * reported, a local file) and a disabled setting both mean unity.
+ */
+internal fun normalizationGainFor(loudnessDb: Double?, enabled: Boolean): Float {
+    if (!enabled || loudnessDb == null) return 1f
+    val gain = 10.0.pow(-loudnessDb / 20.0)
+    return minOf(gain, 1.0).toFloat()
 }

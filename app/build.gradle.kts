@@ -114,6 +114,9 @@ dependencies {
   implementation(libs.androidx.media3.session)
   implementation(libs.androidx.media3.ui)
   implementation(libs.androidx.media3.datasource.okhttp)
+  // StandaloneDatabaseProvider for the streaming disk cache (SimpleCache needs a
+  // DatabaseProvider to keep its index across process restarts).
+  implementation(libs.androidx.media3.database)
 
   // In-app YouTube InnerTube stream extraction and lyrics. No external
   // extractor dependency is used.

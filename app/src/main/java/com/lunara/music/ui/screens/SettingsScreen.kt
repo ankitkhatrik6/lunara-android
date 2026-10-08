@@ -20,8 +20,11 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.lunara.extractor.StreamResolver
+import com.lunara.music.data.models.streamQualityFor
 import com.lunara.music.database.LunaraDatabase
 import com.lunara.music.database.UserPrefEntity
+import com.lunara.music.service.audio.LunaraPlayerManager
 import com.lunara.music.service.download.DownloadManager
 import com.lunara.music.ui.theme.BackgroundDark
 import com.lunara.music.ui.theme.PrimaryIndigo
@@ -47,6 +50,7 @@ fun SettingsScreen(
     var downloadQuality by remember { mutableStateOf("High (256 kbps)") }
     var wifiOnly by remember { mutableStateOf(false) }
     var autoplay by remember { mutableStateOf(true) }
+    var normalizeAudio by remember { mutableStateOf(true) }
     var themeMode by remember { mutableStateOf("Dark (Flagship)") }
     var totalStorageSizeMb by remember { mutableStateOf(0.0) }
 
@@ -64,6 +68,7 @@ fun SettingsScreen(
             if (!storedName.isNullOrBlank()) userName = storedName
             val storedQuality = db.userPrefDao().getPref("audio_quality")
             if (!storedQuality.isNullOrBlank()) audioQuality = storedQuality
+            normalizeAudio = db.userPrefDao().getPref("normalize_audio") != "false"
 
             val size = downloadManager.getTotalDownloadedSize()
             totalStorageSizeMb = size / (1024.0 * 1024.0)
@@ -158,6 +163,21 @@ fun SettingsScreen(
                     subtitle = "Keep playing related songs when queue finishes",
                     checked = autoplay,
                     onCheckedChange = { autoplay = it }
+                )
+            }
+            item {
+                SettingsSwitchItem(
+                    icon = Icons.Outlined.Tune,
+                    title = "Volume normalization",
+                    subtitle = "Balance loudness between songs",
+                    checked = normalizeAudio,
+                    onCheckedChange = { enabled ->
+                        normalizeAudio = enabled
+                        LunaraPlayerManager.setNormalizationEnabled(enabled)
+                        scope.launch(Dispatchers.IO) {
+                            db.userPrefDao().setPref(UserPrefEntity("normalize_audio", enabled.toString()))
+                        }
+                    }
                 )
             }
 
@@ -295,6 +315,10 @@ fun SettingsScreen(
                                 .fillMaxWidth()
                                 .clickable {
                                     audioQuality = opt
+                                    // Apply to the resolver immediately: a setting that
+                                    // needs a restart to reach the playback path reads
+                                    // as broken even when it works.
+                                    StreamResolver.setPreferredQuality(streamQualityFor(opt))
                                     scope.launch(Dispatchers.IO) {
                                         db.userPrefDao().setPref(UserPrefEntity("audio_quality", opt))
                                     }

@@ -104,6 +104,34 @@ object StreamResolver {
     }
 
     /**
+     * The quality the *user* chose, as opposed to the one a single caller asked for.
+     *
+     * Settings write here rather than threading a preference through every call site:
+     * the data source, the player's pre-play resolve and the loading thread's fresh
+     * resolve all read the same value, so one write changes the whole pipeline.
+     */
+    @Volatile
+    private var preferredQuality: StreamQuality = StreamQuality.AUTO
+
+    /** The quality new resolves will use. */
+    fun preferredQuality(): StreamQuality = preferredQuality
+
+    /**
+     * Applies a new quality setting.
+     *
+     * The stream cache is dropped because every entry in it was chosen under the old
+     * setting — keeping them would make the setting appear not to take effect until
+     * each stale entry happened to expire. Blazify bypasses its cache on a quality
+     * change for the same reason. Client health is left alone: it is evidence about
+     * YouTube, not about which format was picked.
+     */
+    fun setPreferredQuality(quality: StreamQuality) {
+        if (quality == preferredQuality) return
+        preferredQuality = quality
+        synchronized(cache) { cache.clear() }
+    }
+
+    /**
      * Resolves [videoId], or says why it could not be resolved.
      *
      * The failure is returned rather than thrown so the UI can say something true:
@@ -112,7 +140,7 @@ object StreamResolver {
      */
     suspend fun resolve(
         videoId: String,
-        quality: StreamQuality = StreamQuality.AUTO,
+        quality: StreamQuality = preferredQuality,
     ): Outcome {
         if (videoId.isBlank()) return Outcome.Failure(ResolveFailure.Unavailable("Empty video id"))
 
@@ -145,7 +173,7 @@ object StreamResolver {
      */
     private suspend fun resolveUncached(
         videoId: String,
-        quality: StreamQuality = StreamQuality.AUTO,
+        quality: StreamQuality = preferredQuality,
     ): Outcome {
         val visitorData = SessionStore.ensure()
         // One token set serves every client: it is bound to the session, not to a
@@ -291,12 +319,36 @@ object StreamResolver {
      *
      * All of them are kept as candidates rather than only the best, because "best" is a
      * guess and the next one down may be the only one the CDN will actually serve.
+     *
+     * The bitrate bands mirror the settings labels ("Data Saver (64 kbps)",
+     * "Normal (128 kbps)", "High Quality (256 kbps)"): each setting prefers its own
+     * class of stream and falls through to the rest rather than refusing them, and
+     * `audio/mp4` wins within a band because every Android device decodes AAC while
+     * Opus in WebM is a coin flip on older hardware.
+     *
+     * Internal rather than private so the band ordering is unit-testable without a
+     * network — a plausible-looking comparator change would otherwise silently
+     * disconnect the settings screen from what actually plays.
      */
-    private fun selectCandidates(
+    internal fun selectCandidates(
         streams: List<AudioStream>,
         quality: StreamQuality,
     ): List<AudioStream> = when (quality) {
-        StreamQuality.HIGH, StreamQuality.AUTO -> streams
+        // The incoming order already is the measured one (mp4, then opus, by bitrate).
+        StreamQuality.AUTO -> streams
+
+        StreamQuality.HIGH -> streams.sortedWith(
+            compareByDescending<AudioStream> { it.bitrate > LOW_BITRATE_CEILING }
+                .thenByDescending { it.bitrate }
+                .thenBy { it.containerMimeType != "audio/mp4" },
+        )
+
+        StreamQuality.NORMAL -> streams.sortedWith(
+            compareByDescending<AudioStream> { it.bitrate <= LOW_BITRATE_CEILING }
+                .thenByDescending { it.bitrate }
+                .thenBy { it.containerMimeType != "audio/mp4" },
+        )
+
         StreamQuality.LOW -> streams.sortedWith(
             compareBy<AudioStream> { it.bitrate > LOW_BITRATE_CEILING }
                 .thenBy { it.bitrate },

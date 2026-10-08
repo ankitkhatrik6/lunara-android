@@ -5,6 +5,7 @@ import android.content.Intent
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
@@ -63,11 +64,23 @@ class LunaraMediaSessionService : MediaSessionService() {
             .build()
 
         // Redirects are handled by the shared OkHttp client above.
-        val upstreamFactory = OkHttpDataSource.Factory(httpClient)
-        val dataSourceFactory = DefaultDataSource.Factory(this, upstreamFactory)
-        // The resolving layer sits *above* DefaultDataSource so it can turn a
-        // schemeless video id into an http URL (and local content:// / file URIs
-        // pass straight through it untouched).
+        val networkFactory = DefaultDataSource.Factory(this, OkHttpDataSource.Factory(httpClient))
+        // The disk cache sits between the resolving layer and the network, the same
+        // place InnerTune and Blazify put theirs: bytes already played are served from
+        // disk on a replay or a back-seek, and only gaps reach the network. Local
+        // file/content URIs never enter it — the resolving layer routes them down
+        // [networkFactory] directly.
+        val diskCache = StreamDiskCache.get(this)
+        val cachedFactory = CacheDataSource.Factory()
+            .setCache(diskCache)
+            .setUpstreamDataSourceFactory(networkFactory)
+            // A corrupt or evicted-underfoot cache entry must degrade into a network
+            // read, not into a playback error.
+            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        // The resolving layer sits *above* the cache so it can turn a schemeless
+        // video id into an http URL (and local content:// / file URIs pass straight
+        // through it untouched), and so its fast path can ask the cache index whether
+        // a range is present before paying for a resolve.
         //
         // The extractor set mirrors Blazify's `createMediaSourceFactory`: every
         // extractor, plus constant-bitrate seeking. A stream whose container says
@@ -76,7 +89,7 @@ class LunaraMediaSessionService : MediaSessionService() {
         // few sniffs on a local file.
         val mediaSourceFactory =
             DefaultMediaSourceFactory(
-                StreamResolvingDataSource.Factory(dataSourceFactory),
+                StreamResolvingDataSource.Factory(cachedFactory, networkFactory, diskCache),
                 DefaultExtractorsFactory().setConstantBitrateSeekingEnabled(true),
             )
 

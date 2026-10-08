@@ -33,6 +33,15 @@ data class AudioStream(
      * layer that merely reports what `/player` said. Null once resolved.
      */
     val signatureCipher: String? = null,
+    /**
+     * The per-video loudness figure YouTube reports in `playerConfig.audioConfig.loudnessDb`.
+     *
+     * It describes the video rather than any one format, but it travels on the stream
+     * because the stream is what carries the audio it measures. The player turns it into
+     * a volume factor with `normalizationGainFor` — InnerTune's rule: attenuate what
+     * YouTube calls loud, never boost what it calls quiet.
+     */
+    val loudnessDb: Double? = null,
 ) {
     val isExpired: Boolean
         get() = expiresAtMs > 0L && expiresAtMs <= System.currentTimeMillis()
@@ -85,6 +94,12 @@ data class AudioStream(
 enum class StreamQuality {
     /** Lowest bitrate that still sounds acceptable. Saves data. */
     LOW,
+
+    /**
+     * The 128 kbps class: the best stream at or below ~130 kbps, falling back to
+     * whatever exists when the catalogue offers nothing in that band.
+     */
+    NORMAL,
 
     /** Best available, up to ~256 kbps Opus. */
     HIGH,

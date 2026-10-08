@@ -8,8 +8,10 @@ import android.util.Log
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import com.lunara.extractor.StreamResolver
 import com.lunara.music.data.models.RepeatMode
 import com.lunara.music.data.models.Song
 import com.lunara.music.data.models.normalizationGainFor
@@ -449,7 +451,7 @@ object LunaraPlayerManager {
                 }
             }
 
-            override fun onPlaybackParametersChanged(parameters: Player.PlaybackParameters) {
+            override fun onPlaybackParametersChanged(parameters: PlaybackParameters) {
                 // No-op: media3 reports these every frame otherwise.
             }
 
@@ -583,7 +585,7 @@ object LunaraPlayerManager {
                 }
 
                 Log.e(TAG, "Playback error: ${error.message}", error)
-                _playbackError.value = "Playback stopped: ${error.message.take(200)}"
+                _playbackError.value = "Playback stopped: ${error.message?.take(200) ?: "stream failure"}"
                 if (wasPlaying) pause()
             }
         })

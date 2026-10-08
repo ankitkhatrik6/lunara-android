@@ -109,7 +109,7 @@ object InnerTubePlayerApi {
             return@withContext null
         } ?: return@withContext null
 
-        runCatching { parse(text, client, visitorData) }.getOrElse {
+        runCatching { parse(text, client) }.getOrElse {
             Log.w(TAG, "Could not read ${client.displayName} response: ${it.message}")
             null
         }
@@ -118,7 +118,6 @@ object InnerTubePlayerApi {
     private fun parse(
         body: String,
         client: ExtractorClient,
-        visitorData: String?,
     ): PlayerResult {
         val root = JSONObject(body)
         val playability = root.optJSONObject("playabilityStatus")
@@ -131,7 +130,7 @@ object InnerTubePlayerApi {
 
         // Formats are only worth reading from a response that says it can play.
         val streams = if (status == "OK") {
-            collectStreams(root, client, visitorData, durationMs, isLive)
+            collectStreams(root, client, durationMs, isLive)
         } else {
             emptyList()
         }
@@ -149,7 +148,6 @@ object InnerTubePlayerApi {
     private fun collectStreams(
         root: JSONObject,
         client: ExtractorClient,
-        visitorData: String?,
         durationMs: Long,
         isLive: Boolean,
     ): List<AudioStream> {
@@ -158,7 +156,7 @@ object InnerTubePlayerApi {
         streamingData.optJSONArray("adaptiveFormats")?.let { collect(it, formats) }
         streamingData.optJSONArray("formats")?.let { collect(it, formats) }
 
-        val headers = client.mediaHeaders(visitorData)
+        val headers = client.mediaHeaders()
 
         // `playerConfig.audioConfig.loudnessDb` describes the video, not the format, so
         // it is read once here and attached to every candidate. A missing figure is a

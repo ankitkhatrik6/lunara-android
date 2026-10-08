@@ -34,9 +34,18 @@ object StreamHeaders {
             ): Boolean = size > MAX_ENTRIES
         }
 
-    /** Binds [url] to [headers] for as long as the stream is played. */
+    /**
+     * Binds [url] to [headers] for as long as the stream is played.
+     *
+     * An **empty** map is a real answer and is stored: the clients Metrolist's
+     * innertubex marks header-silent (`ANDROID_VR`, `VISIONOS`, `TVHTML5_SIMPLY`)
+     * must be requested with no identity headers at all. Skipping the registration
+     * would leave that URL to be answered by the host fallback below — with
+     * *another* client's identity, which is exactly the mismatch that gets a
+     * stream capped at the first megabyte.
+     */
     fun register(url: String, headers: Map<String, String>) {
-        if (url.isBlank() || headers.isEmpty()) return
+        if (url.isBlank()) return
         synchronized(headersByUrl) { headersByUrl[url] = headers }
     }
 
@@ -47,8 +56,10 @@ object StreamHeaders {
             val host = hostOf(url) ?: return emptyMap()
             // Access order: the first entry on the same host is the most recently
             // used one, which is the identity the live request most likely wants.
+            // Empty registrations are skipped: they record "this URL wants no
+            // headers", which says nothing about any other URL on the host.
             for ((registeredUrl, headers) in headersByUrl) {
-                if (hostOf(registeredUrl) == host) return headers
+                if (headers.isNotEmpty() && hostOf(registeredUrl) == host) return headers
             }
         }
         return emptyMap()

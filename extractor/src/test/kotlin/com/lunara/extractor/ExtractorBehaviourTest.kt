@@ -178,14 +178,22 @@ class ExtractorBehaviourTest {
         assertFalse(ignoresIt.contains("visitorData"))
     }
 
-    /** Every media request must be signed with the identity that minted the URL. */
+    /**
+     * Media headers follow innertubex's `buildHeaders` (Metrolist production),
+     * which is *not* the same as the InnerTube API request identity: WEB_REMIX
+     * signs media with `music.youtube.com`, carries `Accept`/`Accept-Language`,
+     * and never sends a visitor id to the media CDN.
+     */
     @Test
     fun `media headers carry the minting identity`() {
         val client = ClientRegistry.MAIN_CLIENT
-        val headers = client.mediaHeaders("VD")
+        val headers = client.mediaHeaders()
         assertEquals(client.userAgent, headers["User-Agent"])
-        assertEquals(client.origin, headers["Origin"])
-        assertEquals(client.referer, headers["Referer"])
+        assertEquals("https://music.youtube.com", headers["Origin"])
+        assertEquals("https://music.youtube.com/", headers["Referer"])
+        assertEquals("*/*", headers["Accept"])
+        assertEquals("en-US,en;q=0.9", headers["Accept-Language"])
+        assertFalse(headers.containsKey("X-Goog-Visitor-Id"))
     }
 
     /**

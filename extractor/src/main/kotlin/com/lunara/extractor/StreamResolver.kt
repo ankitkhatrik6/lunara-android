@@ -418,18 +418,16 @@ object StreamResolver {
             }
 
             tokens?.streamingDataPoToken
-                ?.takeIf { it.isNotBlank() && "pot=" !in url }
                 ?.let { pot ->
-                    val separator = if ('?' in url) '&' else '?'
-                    // Blazify's exact rule: the parameter name is literally "pot", in
-                    // front of the encoded token value. A bare "<token>=<token>" (the
-                    // token acting as its own parameter name) is what serves the first
-                    // megabyte and then 403s, which stops playback at ~1:04.
-                    // The token travels as URL-safe base64 (no `+`, `/`, or `=`),
-                    // because percent-encoding it with `Uri.encode` produced the
-                    // `%2B`/`%2F`/`%3D` escapes the CDN refused.
-                    val encodedPot = urlSafeBase64(pot)
-                    url = "$url$separator pot=$encodedPot"
+                    // The parameter name is literally "pot", directly behind the
+                    // separator — and the value travels as the raw token bytes
+                    // percent-encoded, exactly how Metrolist's innertubex sends it
+                    // (`InnerTubeExtractor.withPoToken`). A stray space before
+                    // "pot=", or rewriting the token's base64 alphabet, hands the CDN
+                    // a token it cannot match: the request then counts as anonymous
+                    // and the media server serves only the first megabyte before
+                    // stopping — the "plays for about a minute then dies" failure.
+                    url = url.withStreamingPoToken(pot)
                 }
         }
 
@@ -512,33 +510,61 @@ object StreamResolver {
         scope.launch { ClientHealth.reset() }
     }
 
-    /**
-     * Re-encodes a base64 token for use in a URL parameter.
-     *
-     * The media CDN accepts the [streamingDataPoToken] as a URL-safe base64 value: no
-     * `+`, no `/`, no trailing padding. The old code percent-encoded the token, which
-     * produced `%2B`/`%2F`/`%3D` escapes the CDN refused, so every resolved stream
-     * served the first ~1 MiB and then stopped mid-song.
-     *
-     * URL-safe base64 maps the token to characters the query string accepts as-is:
-     * `[A-Za-z0-9]_-`, so the value travels untouched to the content server — which is
-     * what makes it answer the whole file instead of cutting it short.
-     */
-    private fun urlSafeBase64(token: String): String {
-        val value = token
-            .replace("+", "-")
-            .replace("/", "_")
-            .replace("=", "")
-        return if (value.contains("%")) {
-            // Defensive: a token that was already percent-encoded must not be encoded
-            // again. Decode once and re-encode safely.
-            try {
-                java.net.URLDecoder.decode(value, "UTF-8")
-            } catch (e: Exception) {
-                value
-            }
+}
+
+/**
+ * Folds the streaming PO token into a media URL as the `pot=` query parameter.
+ *
+ * Ported verbatim from Metrolist's innertubex `InnerTubeExtractor.withPoToken`,
+ * which is what production YouTube Music playback sends. Two properties are
+ * load-bearing, and getting either wrong makes the CDN treat the request as
+ * anonymous and serve only the first megabyte (~1 minute of audio) before the
+ * stream stops:
+ *
+ *  - The parameter name sits directly behind the separator: `&pot=` / `?pot=`.
+ *    A stray space (`& pot=`) makes the parameter unrecognisable to the server.
+ *  - The value is the raw token **percent-encoded** (RFC 3986 query component),
+ *    so the server decodes back to exactly the bytes the token was issued as.
+ *    Rewriting the alphabet (base64url) or double-encoding changes those bytes.
+ *
+ * Fragment-aware: any `#...` tail stays at the very end of the URL.
+ */
+internal fun String.withStreamingPoToken(poToken: String?): String {
+    if (poToken.isNullOrBlank() || contains("&pot=") || contains("?pot=")) return this
+    val fragmentStart = indexOf('#').takeIf { it >= 0 } ?: length
+    val separator = if (indexOf('?').let { it >= 0 && it < fragmentStart }) "&" else "?"
+    return buildString(length + poToken.length + 6) {
+        append(this@withStreamingPoToken, 0, fragmentStart)
+        append(separator)
+        append("pot=")
+        append(poToken.percentEncodeQueryComponent())
+        append(this@withStreamingPoToken, fragmentStart, this@withStreamingPoToken.length)
+    }
+}
+
+/**
+ * RFC 3986 query-component encoding: unreserved characters (`A-Za-z0-9-._~`) pass
+ * through untouched, every other byte becomes `%XX`. Byte-wise, so a standard
+ * base64 token's `+`, `/` and `=` become `%2B`, `%2F` and `%3D` and decode back to
+ * the exact issued value. Ported from innertubex's `encodeQueryComponent`.
+ */
+internal fun String.percentEncodeQueryComponent(): String = buildString(length) {
+    this@percentEncodeQueryComponent.encodeToByteArray().forEach { byte ->
+        val value = byte.toInt() and 0xff
+        if (
+            value in '0'.code..'9'.code ||
+                value in 'A'.code..'Z'.code ||
+                value in 'a'.code..'z'.code ||
+                value == '-'.code ||
+                value == '.'.code ||
+                value == '_'.code ||
+                value == '~'.code
+        ) {
+            append(value.toChar())
         } else {
-            value
+            append('%')
+            append("0123456789ABCDEF"[value ushr 4])
+            append("0123456789ABCDEF"[value and 15])
         }
     }
 }

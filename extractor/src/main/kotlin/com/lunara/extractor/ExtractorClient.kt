@@ -72,17 +72,53 @@ data class ExtractorClient(
     }
 
     /**
-     * Headers the media CDN requires for a URL minted by this client.
+     * Headers the media CDN is sent for a URL minted by this client.
      *
-     * ExoPlayer must send these verbatim. This is why the resolved stream carries its
-     * own headers rather than a single hard-coded User-Agent for everything.
+     * Ported from Metrolist's innertubex `InnerTubeExtractor.buildHeaders` — the
+     * code that production Metrolist playback actually runs — because the media edge
+     * judges identity *per client family*, not uniformly:
+     *
+     *  - `ANDROID_VR`, `VISIONOS` and `TVHTML5_SIMPLY` get **no** headers at all:
+     *    no User-Agent, no Origin, no Referer. Those clients are identified by the
+     *    address itself; a browser Origin riding along is a mismatched identity, and
+     *    a mismatched identity is what gets a stream capped at the first megabyte.
+     *  - Every other client sends its own User-Agent plus `Accept`/`Accept-Language`.
+     *  - `Referer`/`Origin` exist only for the web families, and only in the form the
+     *    site itself uses — `music.youtube.com` for `WEB_REMIX`, never the InnerTube
+     *    API origin.
+     *  - No `X-Goog-Visitor-Id`: innertubex sends visitor data on InnerTube API calls
+     *    only, never to the media CDN.
+     *
+     * ExoPlayer must send whatever this returns verbatim, which is why the resolved
+     * stream carries its headers rather than one hard-coded User-Agent for everything.
      */
-    fun mediaHeaders(visitorData: String? = null): Map<String, String> = buildMap {
+    fun mediaHeaders(): Map<String, String> = buildMap {
+        if (clientName == "ANDROID_VR" || clientName == "VISIONOS" || clientName == "TVHTML5_SIMPLY") {
+            return@buildMap
+        }
         put("User-Agent", userAgent)
-        put("Origin", origin)
-        put("Referer", referer)
-        if (!visitorData.isNullOrBlank() && sendsVisitorData) {
-            put("X-Goog-Visitor-Id", visitorData)
+        put("Accept", "*/*")
+        // hl=en + gl=US, built the way innertubex's YouTubeLocale builds it.
+        put("Accept-Language", "en-US,en;q=0.9")
+        when (clientName) {
+            "WEB_REMIX" -> {
+                put("Origin", "https://music.youtube.com")
+                put("Referer", "https://music.youtube.com/")
+            }
+            "MWEB" -> {
+                put("Origin", "https://m.youtube.com")
+                put("Referer", "https://m.youtube.com/")
+            }
+            "WEB_CREATOR" -> {
+                put("Origin", "https://studio.youtube.com")
+                put("Referer", "https://studio.youtube.com/")
+            }
+            "WEB",
+            "WEB_EMBEDDED_PLAYER",
+            -> {
+                put("Origin", "https://www.youtube.com")
+                put("Referer", "https://www.youtube.com/")
+            }
         }
     }
 

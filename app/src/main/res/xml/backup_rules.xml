@@ -1,8 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <full-backup-content>
-    <!-- Back up the user's library (Room database) and preferences. Offline
-         downloads live in external storage and are intentionally not backed up,
-         so they do not need to be excluded here. -->
-    <include domain="database" path="lunara_database" />
-    <include domain="sharedpref" path="." />
+    <exclude
+        domain="file"
+        path="./exoplayer" />
+    <exclude
+        domain="file"
+        path="./download" />
+    <exclude
+        domain="database"
+        path="exoplayer_internal.db" />
 </full-backup-content>

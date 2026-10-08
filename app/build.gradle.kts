@@ -1,9 +1,10 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import java.util.Properties
 
-plugins {
-  alias(libs.plugins.android.application)
-  alias(libs.plugins.kotlin.compose)
-  alias(libs.plugins.google.devtools.ksp)
+val localProperties = Properties()
+val localPropertiesFile = rootProject.file("local.properties")
+if (localPropertiesFile.exists()) {
+    localProperties.load(localPropertiesFile.inputStream())
 }
 
 // Signing credentials are resolved in this order:
@@ -12,127 +13,333 @@ plugins {
 //   3. The keystore committed at the repository root
 // The same stable key is always used so Android (and Play Protect) accept
 // updates over previously installed builds.
-val signingProps = Properties().apply {
-  val file = rootProject.file("local.properties")
-  if (file.exists()) file.inputStream().use { load(it) }
+fun signingValue(env: String, key: String, fallback: String): String =
+    System.getenv(env)?.takeIf { it.isNotBlank() }
+        ?: localProperties.getProperty(key)?.takeIf { it.isNotBlank() }
+        ?: fallback
+
+val baseApplicationId = "com.lunara.music"
+val applicationIdOverride = System.getenv("METROLIST_APPLICATION_ID")?.takeIf { it.isNotBlank() }
+val appNameOverride = System.getenv("METROLIST_APP_NAME")?.takeIf { it.isNotBlank() }
+val buildCommit =
+    System.getenv("METROLIST_BUILD_COMMIT")
+        ?.trim()
+        ?.takeIf { it.matches(Regex("[0-9a-fA-F]{7,40}")) }
+        ?.take(7)
+        ?.lowercase()
+val debugKeystorePathOverride = System.getenv("METROLIST_DEBUG_KEYSTORE_PATH")?.takeIf { it.isNotBlank() }
+val debugKeystorePassword = System.getenv("METROLIST_DEBUG_KEYSTORE_PASSWORD")?.takeIf { it.isNotBlank() } ?: "android"
+val debugKeyAlias = System.getenv("METROLIST_DEBUG_KEY_ALIAS")?.takeIf { it.isNotBlank() } ?: "androiddebugkey"
+val debugKeyPassword = System.getenv("METROLIST_DEBUG_KEY_PASSWORD")?.takeIf { it.isNotBlank() } ?: "android"
+val persistentDebugKeystoreFile = file("persistent-debug.keystore")
+val workflowDebugKeystoreFile = debugKeystorePathOverride?.let(::file)
+
+plugins {
+    id("com.android.application")
+    alias(libs.plugins.hilt)
+    alias(libs.plugins.kotlin.ksp)
+    alias(libs.plugins.compose.compiler)
+    alias(libs.plugins.kotlin.serialization)
+    alias(libs.plugins.protobuf)
 }
 
-fun signingValue(env: String, key: String, fallback: String): String =
-  System.getenv(env)?.takeIf { it.isNotBlank() }
-    ?: signingProps.getProperty(key)?.takeIf { it.isNotBlank() }
-    ?: fallback
-
 android {
-  namespace = "com.lunara.music"
-  compileSdk { version = release(36) { minorApiLevel = 1 } }
+    namespace = "com.metrolist.music"
+    compileSdk = 37
 
-  defaultConfig {
-    applicationId = "com.lunara.music"
-    minSdk = 24
-    targetSdk = 36
-    // Increment versionCode for every published update. A stable applicationId,
-    // a stable signing key and a strictly increasing versionCode together are
-    // what allow an APK to be installed over a previous build.
-    versionCode = 15
-    versionName = "2.2.7"
-    testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-  }
+    defaultConfig {
+        applicationId = applicationIdOverride ?: baseApplicationId
+        minSdk = 26
+        targetSdk = 36
+        // Lunara release line: strictly increasing over the previous Lunara
+        // versionCode (15) so Android accepts this build as an in-place update
+        // of the installed app.
+        versionCode = 16
+        versionName = "2.2.9"
+        val baseVersionName = requireNotNull(versionName)
+        buildConfigField("String", "BASE_VERSION_NAME", "\"$baseVersionName\"")
+        buildCommit?.let { versionName = "$baseVersionName+$it" }
+        resValue("string", "app_name", appNameOverride ?: "Lunara")
 
-  signingConfigs {
-    create("release") {
-      storeFile = file(signingValue("KEYSTORE_PATH", "lunara.storeFile", "${rootDir}/lunara-upload-key.jks"))
-      storePassword = signingValue("STORE_PASSWORD", "lunara.storePassword", "lunara-upload")
-      keyAlias = signingValue("KEY_ALIAS", "lunara.keyAlias", "lunara")
-      keyPassword = signingValue("KEY_PASSWORD", "lunara.keyPassword", "lunara-upload")
-      enableV1Signing = true
-      enableV2Signing = true
-      enableV3Signing = true
-    }
-  }
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        vectorDrawables.useSupportLibrary = true
 
-  buildTypes {
-    release {
-      isMinifyEnabled = false
-      isShrinkResources = false
-      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      signingConfig = signingConfigs.getByName("release")
-    }
-    debug {
-      isMinifyEnabled = false
-      // Sign debug builds with the same stable key as release. Without this,
-      // installing a release build over a debug build (or the reverse) fails
-      // with INSTALL_FAILED_UPDATE_INCOMPATIBLE ("App not installed"), because
-      // the signing certificates would differ even though the package matches.
-      signingConfig = signingConfigs.getByName("release")
-    }
-  }
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+        }
 
-  compileOptions {
-    sourceCompatibility = JavaVersion.VERSION_11
-    targetCompatibility = JavaVersion.VERSION_11
-  }
-  buildFeatures {
-    compose = true
-    buildConfig = true
-  }
-  testOptions { unitTests { isIncludeAndroidResources = true } }
-  dependenciesInfo {
-    includeInApk = false
-    includeInBundle = true
-  }
-  packaging {
-    resources {
-      excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        // LastFM API keys from GitHub Secrets
+        val lastFmKey = localProperties.getProperty("LASTFM_API_KEY") ?: System.getenv("LASTFM_API_KEY") ?: ""
+        val lastFmSecret = localProperties.getProperty("LASTFM_SECRET") ?: System.getenv("LASTFM_SECRET") ?: ""
+
+        buildConfigField("String", "LASTFM_API_KEY", "\"$lastFmKey\"")
+        buildConfigField("String", "LASTFM_SECRET", "\"$lastFmSecret\"")
+        buildConfigField("String", "ARCHITECTURE", "\"universal\"")
+        buildConfigField("Long", "DISCORD_APP_ID", "1447278780795064401L")
     }
-  }
+
+    flavorDimensions += listOf("variant")
+    productFlavors {
+        // FOSS - Updater, but no gcast
+        create("foss") {
+            dimension = "variant"
+            isDefault = true
+            buildConfigField("Boolean", "CAST_AVAILABLE", "false")
+            buildConfigField("Boolean", "UPDATER_AVAILABLE", "true")
+        }
+
+        // GMS - Updater and gcast
+        create("gms") {
+            dimension = "variant"
+            buildConfigField("Boolean", "CAST_AVAILABLE", "true")
+            buildConfigField("Boolean", "UPDATER_AVAILABLE", "true")
+        }
+
+        // IzzyOnDroid - no gcast, no updater - the ONLY F-droid compliant build
+        create("izzy") {
+            dimension = "variant"
+            buildConfigField("Boolean", "CAST_AVAILABLE", "false")
+            buildConfigField("Boolean", "UPDATER_AVAILABLE", "false")
+        }
+    }
+
+    signingConfigs {
+        create("persistentDebug") {
+            storeFile = persistentDebugKeystoreFile
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+        create("workflowDebug") {
+            storeFile = workflowDebugKeystoreFile ?: persistentDebugKeystoreFile
+            storePassword = debugKeystorePassword
+            keyAlias = debugKeyAlias
+            keyPassword = debugKeyPassword
+        }
+        create("release") {
+            storeFile = file(
+                signingValue(
+                    "KEYSTORE_PATH",
+                    "lunara.storeFile",
+                    "${rootDir}/lunara-upload-key.jks",
+                ),
+            )
+            storePassword = signingValue("STORE_PASSWORD", "lunara.storePassword", "lunara-upload")
+            keyAlias = signingValue("KEY_ALIAS", "lunara.keyAlias", "lunara")
+            keyPassword = signingValue("KEY_PASSWORD", "lunara.keyPassword", "lunara-upload")
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
+        }
+        getByName("debug") {
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+            storePassword = "android"
+            storeFile = file("${System.getProperty("user.home")}/.android/debug.keystore")
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            isCrunchPngs = false
+            isDebuggable = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+        }
+        debug {
+            if (applicationIdOverride == null) {
+                applicationIdSuffix = ".debug"
+            }
+            isDebuggable = true
+            if (appNameOverride == null) {
+                resValue("string", "app_name", "Lunara Debug")
+            }
+            signingConfig =
+                if (workflowDebugKeystoreFile != null) {
+                    signingConfigs.getByName("workflowDebug")
+                } else if (persistentDebugKeystoreFile.exists()) {
+                    signingConfigs.getByName("persistentDebug")
+                } else {
+                    signingConfigs.getByName("debug")
+                }
+        }
+    }
+
+    compileOptions {
+        isCoreLibraryDesugaringEnabled = true
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
+    }
+
+    kotlin {
+        jvmToolchain(21)
+        compilerOptions {
+            jvmTarget.set(JvmTarget.JVM_21)
+        }
+    }
+
+    buildFeatures {
+        compose = true
+        buildConfig = true
+        resValues = true
+    }
+
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
+    }
+
+    lint {
+        lintConfig = file("lint.xml")
+        warningsAsErrors = false
+        abortOnError = false
+        checkDependencies = false
+        // Lint never gated anything here (abortOnError = false), so the
+        // lintVital pass that assembleRelease implicitly triggers was pure
+        // build time. Run lint on demand with ./gradlew :app:lintGmsRelease.
+        checkReleaseBuilds = false
+    }
+
+    androidResources {
+        generateLocaleConfig = true
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+            keepDebugSymbols +=
+                listOf(
+                    "**/libandroidx.graphics.path.so",
+                    "**/libdatastore_shared_counter.so",
+                )
+        }
+        resources {
+            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+            excludes += "META-INF/NOTICE.md"
+            excludes += "META-INF/CONTRIBUTORS.md"
+            excludes += "META-INF/LICENSE.md"
+            excludes += "META-INF/INDEX.LIST"
+            excludes += "META-INF/io.netty.versions.properties"
+        }
+    }
+}
+
+protobuf {
+    protoc {
+        artifact = "com.google.protobuf:protoc:${libs.versions.protobuf.get()}"
+    }
+    generateProtoTasks {
+        all().configureEach {
+            builtins {
+                create("java") { option("lite") }
+                create("kotlin") { option("lite") }
+            }
+        }
+    }
+}
+
+val cleanLegacyProtoSources = tasks.register<Delete>("cleanLegacyProtoSources") {
+    delete(layout.projectDirectory.dir("src/main/java/com/metrolist/music/listentogether/proto"))
+}
+
+tasks.named("preBuild") {
+    dependsOn(cleanLegacyProtoSources)
+}
+
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
+}
+
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+    compilerOptions {
+        freeCompilerArgs.addAll(
+            "-opt-in=kotlin.RequiresOptIn",
+        )
+        suppressWarnings.set(false)
+    }
+}
+
+// Android provides org.json as a platform API (/apex/com.android.art/javalib/core-libart.jar).
+// The standalone org.json:json artefact bundles an older Apache Harmony copy of JSONArray that
+// contains an internal `myArrayList` field absent from the platform class.  Without obfuscation
+// R8 inlines against this internal field; at runtime the platform class is resolved instead,
+// producing a NoSuchFieldError.  Excluding the artefact globally ensures only the platform
+// class is ever referenced.
+configurations.configureEach {
+    exclude(group = "org.json", module = "json")
 }
 
 dependencies {
-  implementation(platform(libs.androidx.compose.bom))
-  implementation(libs.androidx.activity.compose)
-  implementation(libs.androidx.compose.material.icons.core)
-  implementation(libs.androidx.compose.material.icons.extended)
-  implementation(libs.androidx.compose.material3)
-  implementation(libs.androidx.compose.ui)
-  implementation(libs.androidx.compose.ui.graphics)
-  implementation(libs.androidx.compose.ui.tooling.preview)
-  implementation(libs.androidx.core.ktx)
-  implementation(libs.androidx.lifecycle.runtime.compose)
-  implementation(libs.androidx.lifecycle.runtime.ktx)
-  implementation(libs.androidx.lifecycle.viewmodel.compose)
-  implementation(libs.androidx.navigation.compose)
-  implementation(libs.androidx.room.ktx)
-  implementation(libs.androidx.room.runtime)
-  implementation(libs.coil.compose)
+    implementation(libs.guava)
+    implementation(libs.coroutines.guava)
 
-  // LunaraExtractor: the stream-extraction engine (BotGuard PO-token minting,
-  // client rotation, stream resolution). This is what makes online playback work.
-  implementation(project(":extractor"))
+    implementation(libs.activity)
+    implementation(libs.hilt.navigation)
+    implementation(libs.datastore)
 
-  // Audio engine (Media3 / ExoPlayer) + OkHttp-backed streaming data source.
-  implementation(libs.androidx.media3.exoplayer)
-  implementation(libs.androidx.media3.session)
-  implementation(libs.androidx.media3.ui)
-  implementation(libs.androidx.media3.datasource.okhttp)
-  // StandaloneDatabaseProvider for the streaming disk cache (SimpleCache needs a
-  // DatabaseProvider to keep its index across process restarts).
-  implementation(libs.androidx.media3.database)
+    implementation(libs.compose.runtime)
+    implementation(libs.compose.foundation)
+    implementation(libs.compose.ui)
+    implementation(libs.compose.ui.util)
+    implementation(libs.compose.animation)
+    implementation(libs.compose.reorderable)
 
-  // In-app YouTube InnerTube stream extraction and lyrics. No external
-  // extractor dependency is used.
-  implementation(libs.okhttp)
+    implementation(libs.viewmodel.compose)
+    implementation(libs.lifecycle.process)
 
-  implementation(libs.kotlinx.coroutines.android)
-  implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.material3)
+    implementation(libs.palette)
+    implementation(libs.materialKolor)
 
-  testImplementation(libs.junit)
-  testImplementation(libs.androidx.junit)
-  testImplementation(libs.androidx.core)
-  testImplementation(libs.kotlinx.coroutines.test)
-  testImplementation(libs.robolectric)
+    implementation(libs.appcompat)
 
-  debugImplementation(libs.androidx.compose.ui.tooling)
-  debugImplementation(libs.androidx.compose.ui.test.manifest)
+    implementation(libs.coil)
+    implementation(libs.coil.network.okhttp)
+    implementation(libs.browser)
 
-  "ksp"(libs.androidx.room.compiler)
+    implementation(libs.ucrop)
+
+    implementation(libs.shimmer)
+
+    implementation(libs.media3)
+    implementation(libs.media3.session)
+    implementation(libs.media3.okhttp)
+
+    // Google Cast - only included in GMS flavor (not available in F-Droid/FOSS builds)
+    "gmsImplementation"(libs.media3.cast)
+    "gmsImplementation"(libs.mediarouter)
+    "gmsImplementation"(libs.cast.framework)
+
+    implementation(libs.room.runtime)
+    implementation(libs.kuromoji.ipadic)
+    implementation(libs.tinypinyin)
+    ksp(libs.room.compiler)
+
+    implementation(libs.hilt)
+    ksp(libs.hilt.compiler)
+
+    implementation(project(":innertube"))
+
+    implementation(libs.ktor.client.core)
+    implementation(libs.ktor.client.okhttp)
+    implementation(libs.ktor.client.content.negotiation)
+    implementation(libs.ktor.client.encoding)
+    implementation(libs.ktor.serialization.json)
+
+    // Protobuf for message serialization (lite version for Android)
+    implementation(libs.protobuf.javalite)
+    implementation(libs.protobuf.kotlin.lite)
+
+    coreLibraryDesugaring(libs.desugaring)
+
+    implementation(libs.timber)
+
+    testImplementation(libs.junit)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.test.core)
+    testImplementation(libs.ktor.client.mock)
 }

@@ -1,6 +1,5 @@
 package com.lunara.music.service.audio
 
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.Response
 

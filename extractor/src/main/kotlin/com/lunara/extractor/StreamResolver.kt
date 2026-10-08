@@ -425,7 +425,11 @@ object StreamResolver {
                     // front of the encoded token value. A bare "<token>=<token>" (the
                     // token acting as its own parameter name) is what serves the first
                     // megabyte and then 403s, which stops playback at ~1:04.
-                    url = "$url$separator pot=${Uri.encode(pot)}"
+                    // The token travels as URL-safe base64 (no `+`, `/`, or `=`),
+                    // because percent-encoding it with `Uri.encode` produced the
+                    // `%2B`/`%2F`/`%3D` escapes the CDN refused.
+                    val encodedPot = urlSafeBase64(pot)
+                    url = "$url$separator pot=$encodedPot"
                 }
         }
 
@@ -506,5 +510,34 @@ object StreamResolver {
     fun clear() {
         synchronized(cache) { cache.clear() }
         scope.launch { ClientHealth.reset() }
+
+    /**
+     * Re-encodes a base64 token for use in a URL parameter.
+     *
+     * The media CDN accepts the [streamingDataPoToken] as a URL-safe base64 value: no
+     * `+`, no `/`, no trailing padding. The old code percent-encoded the token, which
+     * produced `%2B`/`%2F`/`%3D` escapes the CDN refused, so every resolved stream
+     * served the first ~1 MiB and then stopped mid-song.
+     *
+     * URL-safe base64 maps the token to characters the query string accepts as-is:
+     * `[A-Za-z0-9]_-`, so the value travels untouched to the content server — which is
+     * what makes it answer the whole file instead of cutting it short.
+     */
+    private fun urlSafeBase64(token: String): String {
+        val value = token
+            .replace("+", "-")
+            .replace("/", "_")
+            .replace("=", "")
+        return if (value.contains("%")) {
+            // Defensive: a token that was already percent-encoded must not be encoded
+            // again. Decode once and re-encode safely.
+            try {
+                java.net.URLDecoder.decode(value, "UTF-8")
+            } catch (e: Exception) {
+                value
+            }
+        } else {
+            value
+        }
     }
 }

@@ -10,15 +10,15 @@ import androidx.media3.datasource.cache.SimpleCache
 /**
  * The single disk cache streamed audio is read through and written back to.
  *
- * Both reference apps — Blazify and InnerTune — keep one around: a `SimpleCache`
+ * Both reference apps — Blazify and InnerTune — keep one around: a [SimpleCache]
  * with a least-recently-used evictor, consulted by the resolving data source before
  * any network work. Without it every replay, every back-seek and every re-listen
  * re-downloads the whole song; with it those are disk reads. It also shrinks the
  * number of requests YouTube sees from this device, which is not nothing given how
  * readily the catalogue bot-gates a client.
  *
- * Exactly one instance per process, because `SimpleCache` refuses a second one on
- * the same directory — the singleton is what keeps the service's `onCreate` from
+ * Exactly one instance per process, because [SimpleCache] refuses a second one on
+ * the same directory — the singleton is what keeps the service's [onCreate] from
  * discovering that the hard way after a restart.
  *
  * 512 MB is roughly forty hours of 128 kbps audio: far more than anyone replays in
@@ -34,7 +34,7 @@ object StreamDiskCache {
     private const val DIRECTORY = "stream_cache"
 
     @Volatile
-    private var cache: SimpleCache? = null
+    private var cache: Cache? = null
 
     /** Returns the process-wide cache, creating it on first use — or null when the
      * cache directory is unusable (a lock left behind, a full disk). Null is a

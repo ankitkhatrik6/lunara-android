@@ -53,53 +53,29 @@ class LunaraMediaSessionService : MediaSessionService() {
 
         val httpClient = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
-            // Generous read timeout: a long silent stretch must not drop the
-            // connection and force a re-buffer from scratch.
             .readTimeout(30, TimeUnit.SECONDS)
             .followRedirects(true)
             .retryOnConnectionFailure(true)
-            // Attach the minting client's identity to every media request for a
-            // registered stream; unregistered URLs pass through untouched.
             .addInterceptor(StreamHeaderInterceptor())
             .build()
 
-        // Redirects are handled by the shared OkHttp client above.
         val networkFactory = DefaultDataSource.Factory(this, OkHttpDataSource.Factory(httpClient))
-        // The disk cache sits between the resolving layer and the network, the same
-        // place InnerTune and Blazify put theirs: bytes already played are served from
-        // disk on a replay or a back-seek, and only gaps reach the network. Local
-        // file/content URIs never enter it — the resolving layer routes them down
-        // [networkFactory] directly. Null when the cache directory is unusable, in
-        // which case remoteFactory itself takes every load (no caching, no crash).
         val diskCache = StreamDiskCache.get(this)
         val remoteFactory = if (diskCache != null) {
             CacheDataSource.Factory()
                 .setCache(diskCache)
                 .setUpstreamDataSourceFactory(networkFactory)
-                // A corrupt or evicted-underfoot cache entry must degrade into a network
-                // read, not into a playback error.
                 .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
         } else {
             networkFactory
         }
-        // The resolving layer sits *above* the cache so it can turn a schemeless
-        // video id into an http URL (and local content:// / file URIs pass straight
-        // through it untouched), and so its fast path can ask the cache index whether
-        // a range is present before paying for a resolve.
-        //
-        // The extractor set mirrors Blazify's `createMediaSourceFactory`: every
-        // extractor, plus constant-bitrate seeking. A stream whose container says
-        // little about its own index still seeks (this is what turns a tap on the
-        // progress bar into music instead of a stalled player), and the cost is a
-        // few sniffs on a local file.
+
         val mediaSourceFactory =
             DefaultMediaSourceFactory(
                 StreamResolvingDataSource.Factory(remoteFactory, networkFactory, diskCache),
                 DefaultExtractorsFactory().setConstantBitrateSeekingEnabled(true),
             )
 
-        // Buffer like Blazify: enough ahead that an ordinary drop in signal passes
-        // unheard, quick enough to start that the first note is not a wait.
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
                 /* minBufferMs = */ 50_000,
@@ -112,8 +88,8 @@ class LunaraMediaSessionService : MediaSessionService() {
             .build()
 
         val player = ExoPlayer.Builder(this)
-            .setAudioAttributes(audioAttributes, true) // handles audio focus
-            .setHandleAudioBecomingNoisy(true) // pauses when headphones unplugged
+            .setAudioAttributes(audioAttributes, true)
+            .setHandleAudioBecomingNoisy(true)
             .setWakeMode(C.WAKE_MODE_NETWORK)
             .setLoadControl(loadControl)
             .setMediaSourceFactory(mediaSourceFactory)

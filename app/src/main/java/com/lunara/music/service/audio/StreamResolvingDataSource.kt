@@ -15,378 +15,91 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.IOException
 
-/**
- * The size of one network load, in bytes.
- *
- * The player is never given a googlevideo URL to hold open for a whole song. Every
- * load asks the resolver for an address and takes at most this many bytes from it,
- * then comes back. That is the same chunking Blazify (and the InnerTune family
- * before it) streams with, and it is what turns the failure modes of a single
- * long-lived connection into non-events:
- *
- *  - A URL that expires, gets capped at 1 MiB, or is refused on a later range
- *    request only kills *one* chunk: the next open resolves a fresh URL while the
- *    buffer still holds tens of seconds of audio.
- *  - A connection the CDN drops mid-transfer costs one chunk; the recovery below
- *    resumes from the exact byte offset on a new connection.
- *  - Identity headers are re-attached at every open, so a registry eviction can
- *    never leave a live request without them.
- *
- * 512 KiB is ~30 seconds of a 128 kbps song — large enough that chunk boundaries
- * are rare, small enough that recovery work is bounded.
- */
 private const val STREAM_CHUNK_LENGTH = 512L * 1024L
-
-/** HTTP codes that mean "this address is dead", as opposed to "this connection failed". */
 private val REFUSED_CODES = setOf(401, 403, 410)
+private const val RANGE_NOT_SATISFIED = 416
 
-/** "The range starts past the end of the file" — a real end of stream, not a refusal. */
-private const val RANGE_NOT_SATISFIABLE = 416
-
-/**
- * The response code when this failure is the CDN refusing the address outright
- * (expired, capped at 1 MiB, or the identity moved on), or null for any other
- * I/O failure — a dropped connection, a timeout — which the same URL may yet
- * survive. Matching on [HttpDataSource.InvalidResponseCodeException] is what keeps
- * "this address is dead" distinct from "this connection failed".
- */
-private fun IOException.refusedCode(): Int? =
-    (this as? HttpDataSource.InvalidResponseCodeException)
-        ?.responseCode
-        ?.takeIf { it in REFUSED_CODES }
-
-/** Whether this failure means the address itself is dead (see [refusedCode]). */
-private fun IOException.isRefused(): Boolean = refusedCode() != null
-
-/**
- * Resolves stream URLs at request time and reads them in fixed-size chunks.
- *
- * This is Lunara's counterpart of Blazify's `ResolvingDataSource` pipeline. The
- * player's `MediaItem` for an online song carries the **video id** (no scheme) and
- * the song id as its custom cache key; a literal `file://`, `content://` or `http(s)`
- * URI passes straight through.
- *
- * For a video id, every [open] runs these steps in order:
- *
- *  1. **Disk-cache fast path.** If the wanted range is already on disk under this
- *     song's key, it is served without resolving at all — no token mint, no player
- *     round trip, no network. The spec handed to the cache is capped at exactly the
- *     verified-cached range so the cache can never fall through to an upstream
- *     request carrying the schemeless URI.
- *  2. Resolve (through [StreamResolver], whose cache makes this instant in the
- *     common case and whose lock makes concurrent opens for one track share work).
- *     A refusal becomes an [IOException] with a message a human can act on.
- *  3. Bind the minting identity's headers to the URL so the OkHttp interceptor
- *     sends them on every range request.
- *  4. Open the remote delegate (disk cache over network) with the URL capped at
- *     [STREAM_CHUNK_LENGTH] bytes via [DataSpec.subrange], so the load ends cleanly
- *     and the *next* open gets a fresh resolution decision. Bytes the cache already
- *     holds are served from disk; only the gap goes to the network, and what arrives
- *     is written back under the song's key for the next replay.
- *
- * Local files take the local chain instead — straight to the phone's copy, never
- * copied into the stream cache (Blazify reads phone files off the phone).
- *
- * Failures heal in place instead of restarting the song:
- *
- *  - A refused address at open time (401/403/410 — expired or capped) drops the
- *    resolver's cache entry and retries once with a freshly minted URL.
- *  - A connection that dies mid-chunk reopens on a new connection **at the exact
- *    byte offset** and keeps filling the same buffer. The player never notices.
- *
- * Resolving blocks the caller, which is the player's loading thread — never the UI
- * thread. That is deliberate and matches Blazify: the buffer is what pays for the
- * lookup, and the lookup has to come back before the load can.
- */
-class StreamResolvingDataSource private constructor(
-    private val remoteFactory: DataSource.Factory,
-    private val localFactory: DataSource.Factory,
+class StreamResolvingDataSource(
+    private val remoteUpstream: DataSource.Factory,
+    private val localUpstream: DataSource.Factory,
     private val streamCache: Cache?,
 ) : DataSource {
 
-    /** The schemeless spec this load was opened with; the source of truth for recovery. */
-    private var baseSpec: DataSpec? = null
+    private var current: DataSource? = null
+    private var currentKey: String? = null
+    private var currentUrl: String? = null
+    private var currentStream: AudioStream? = null
+    private var currentCache: Cache? = null
+    private var offsetLocked = 0L
 
-    /** The track being read, or null when the load was a pass-through (local file, live URL). */
-    private var videoId: String? = null
+    private var lastResolvedPosition = -1L
+    private var lastResolvedBuffered = -1L
 
-    /** Absolute position of the current chunk, and how much of it has been read. */
-    private var chunkStart = 0L
-    private var chunkBytesRead = 0L
-
-    /** Declared stream length when known; guards the capped-EOS heuristic at real EOF. */
-    private var expectedEnd = -1L
-
-    /** One in-place recovery per open; a second failure belongs to the player's retry policy. */
-    private var recoveredDuringRead = false
-
-    /**
-     * True while the current load is served entirely from the disk cache.
-     *
-     * The early-EOS heuristic exists to catch a *CDN* cutting a stream off. A cache
-     * read has no CDN: it delivers exactly what is stored or throws, so the "stream
-     * ended early, re-resolve" branch must stay out of its way — otherwise the last
-     * short chunk of a fully cached song would burn a needless network resolve at
-     * every replay.
-     */
-    private var cacheOnlyRead = false
-
-    /** The active delegate for this load. Created per open so the chain can differ. */
-    private lateinit var delegate: DataSource
-
-    /**
-     * Transfer listeners seen for this source.
-     *
-     * The player registers its listener *before* opening, while no delegate exists
-     * yet, and a mid-open retry replaces the delegate — so listeners are kept and
-     * applied to every delegate that gets created, not just the first.
-     */
-    private val pendingListeners = mutableListOf<TransferListener>()
-
-    override fun addTransferListener(transferListener: TransferListener) {
-        pendingListeners.add(transferListener)
-        if (::delegate.isInitialized) delegate.addTransferListener(transferListener)
-    }
-
-    /** Builds the delegate for this load and attaches every listener seen so far. */
-    private fun newDelegate(factory: DataSource.Factory): DataSource {
-        val created = factory.createDataSource()
-        pendingListeners.forEach { created.addTransferListener(it) }
-        delegate = created
-        return created
-    }
-
-    /** Opens [spec], closing [source] again if the open itself fails. */
-    private fun openOrFail(source: DataSource, spec: DataSpec): Long = try {
-        source.open(spec)
-    } catch (e: IOException) {
-        // A failed open must not leave a half-initialised delegate behind for the
-        // loader to trip over; closing it here is what makes the instance safe to
-        // drop (or to replace with a fresh one on the next attempt).
-        runCatching { source.close() }
-        throw e
-    }
-
-    override fun open(dataSpec: DataSpec): Long {
-        recoveredDuringRead = false
-        cacheOnlyRead = false
-
-        // A real address has nothing to look up, and the chain it takes depends on
-        // what the address is: an http(s) URL is already resolved and passes through
-        // the cache chain like any other bytes; a file on the phone goes straight to
-        // the phone's copy (Blazify reads local files off the phone — routing them
-        // through the stream cache would only duplicate them on disk).
-        val scheme = dataSpec.uri.scheme
-        if (scheme != null) {
-            videoId = null
-            baseSpec = dataSpec
-            val factory =
-                if (scheme == "http" || scheme == "https") remoteFactory else localFactory
-            return openOrFail(newDelegate(factory), dataSpec)
+    override fun open(dataSpec: DataSpec): DataSource {
+        val spec = dataSpec
+        if (spec.uri.scheme != null) {
+            return localUpstream.createDataSource().apply { open(spec) }
         }
 
-        val id = dataSpec.key?.takeIf { it.isNotBlank() } ?: dataSpec.uri.toString()
-        // Give the spec an explicit key when the MediaItem carried none, so the disk
-        // cache files every chunk under the video id instead of under whichever
-        // googlevideo URL happened to mint it — per-URL keys would never match again
-        // on the next play and the cache could never serve a replay.
-        val spec =
-            if (dataSpec.key.isNullOrBlank()) dataSpec.buildUpon().setKey(id).build() else dataSpec
-        baseSpec = spec
-        videoId = id
+        val videoId = spec.key ?: spec.uri.lastPathSegment ?: spec.uri.toString()
 
-        // Cache fast path: the wanted range is already on disk under this key, so the
-        // open needs no player round trip, no token and no network at all. The spec is
-        // capped at exactly the range just verified cached — that cap is what makes it
-        // safe for the URI to still be the schemeless video id, because the cache can
-        // never reach an upstream request it cannot serve from disk.
-        val cache = streamCache
-        if (cache != null) {
-            val wanted = if (spec.length >= 0L) spec.length else STREAM_CHUNK_LENGTH
-            if (wanted > 0L && cache.isCached(id, spec.position, wanted)) {
-                cacheOnlyRead = true
-                expectedEnd = -1L
-                val bytes = openOrFail(newDelegate(remoteFactory), spec.subrange(0L, wanted))
-                chunkStart = spec.position + spec.uriPositionOffset
-                chunkBytesRead = 0
-                return bytes
-            }
-        }
-
-        var attempt = 0
-        while (true) {
-            val stream = resolveStream(id)
-            expectedEnd = stream.contentLength.takeIf { it > 0 } ?: -1L
-            StreamHeaders.register(stream.url, stream.headers)
-            val current = newDelegate(remoteFactory)
-            try {
-                val bytes = current.open(chunkSpecFor(spec, stream.url))
-                chunkStart = spec.position + spec.uriPositionOffset
-                chunkBytesRead = 0
-                return bytes
-            } catch (e: IOException) {
-                runCatching { current.close() }
-                // A refusal means this URL is dead (expired, capped at 1 MiB, or the
-                // identity moved on); anything else is a connection that may yet work
-                // on a second try. Either way the retry is one bounded round trip.
-                if (e.isRefused()) {
-                    Log.w(TAG, "CDN refused $id (${e.refusedCode()}); re-resolving", e)
-                    // Drop the dead URL — NOT the client. Blazify rests nothing from
-                    // playback: a position-based refusal (the 1 MiB wall) says nothing
-                    // about the minting client, and resting it for ten minutes pushed
-                    // every following song onto weaker fallbacks — the "every song
-                    // dies at 1:04" spiral. A fresh resolve gets a fresh address,
-                    // which is what actually changes the answer.
-                    StreamResolver.invalidate(id)
-                    val fresh = StreamResolver.resolveFreshBlocking(id)
-                        ?: throw IOException("The stream was refused. Check your connection and retry.")
-                    expectedEnd = fresh.contentLength.takeIf { it > 0 } ?: -1L
-                    StreamHeaders.register(fresh.url, fresh.headers)
-                    val replacement = newDelegate(remoteFactory)
-                    try {
-                        val bytes = replacement.open(chunkSpecFor(spec, fresh.url))
-                        chunkStart = spec.position + spec.uriPositionOffset
-                        chunkBytesRead = 0
-                        return bytes
-                    } catch (e2: IOException) {
-                        runCatching { replacement.close() }
-                        // One minted replacement is the budget here; a second refusal
-                        // belongs to the player's retry policy, which re-resolves the
-                        // whole load. Failing fast is what keeps a forward-seek past a
-                        // dead region reading as a short error instead of the loading
-                        // thread hanging for tens of seconds with the UI spinning.
-                        if (attempt < 1) {
-                            attempt += 1
-                            continue
-                        }
-                        throw e2
+        if (spec.position == 0L) {
+            val cachedRange = streamCache?.getFileLength(videoId) ?: 0L
+            if (cachedRange > 0L && cachedRange >= spec.position + spec.length) {
+                val cacheSpec = spec
+                    .withUri(Uri.parse(videoId))
+                    .withKey(videoId)
+                    .withPosition(0L)
+                    .withLength(cachedRange)
+                val cacheDs = streamCache?.openInputStream(cacheSpec)?.let { ds ->
+                    object : DataSource() {
+                        override fun openTypedDataListener(listener: TransferListener): DataSource =
+                            this@StreamResolvingDataSource.openTypedDataListener(listener)
+                        override fun close() {}
+                        override val error: IOException? get() = null
+                        override val position: Long get() = -1L
+                        override val length: Long get() = -1L
+                        override val cacheKey: String? get() = videoId
+                        override val uri: Uri get() = Uri.parse(videoId)
                     }
                 }
-                if (attempt < 1) {
-                    attempt += 1
-                    continue
-                }
-                throw e
+                if (cacheDs != null) return cacheDs
             }
         }
-    }
 
-    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
-        try {
-            val read = delegate.read(buffer, offset, length)
-            if (read > 0) chunkBytesRead += read
-            if (read == C.RESULT_END_OF_INPUT && !recoveredDuringRead) {
-                // Capped URLs die with 403 at the 1 MiB wall, but a server that ends a
-                // chunk early (exact EOF, short file) also reports EOS. Only a short
-                // read far below the chunk size, well before the stream's known end,
-                // means the CDN cut us off. Reconnect in place on a fresh URL so the
-                // song keeps playing; if even that cannot be opened, fail loudly so the
-                // player's retry re-resolves from this position — silently returning
-                // EOS here is what turns a capped URL into a song that stops early.
-                val id = videoId
-                val spec = baseSpec
-                if (id != null && spec != null && !cacheOnlyRead &&
-                    chunkBytesRead < STREAM_CHUNK_LENGTH / 2 &&
-                    (expectedEnd < 0 || chunkStart + chunkBytesRead < expectedEnd - 64L * 1024L)
-                ) {
-                    recoveredDuringRead = true
-                    val resumeAt = chunkStart + chunkBytesRead
-                    Log.w(TAG, "Stream for $id ended early at byte $resumeAt; re-resolving")
-                    StreamResolver.invalidate(id)
-                    runCatching { delegate.close() }
-                    val fresh = StreamResolver.resolveFreshBlocking(id)
-                        ?: throw IOException("The stream stopped early. Check your connection and retry.")
-                    expectedEnd = fresh.contentLength.takeIf { it > 0 } ?: -1L
-                    StreamHeaders.register(fresh.url, fresh.headers)
-                    val resumed = try {
-                        reopenAt(spec, fresh.url, resumeAt)
-                        true
-                    } catch (e2: HttpDataSource.InvalidResponseCodeException) {
-                        // The offset starts past the end of the file: this really was
-                        // the end of the stream, not a cut-off, so say EOS and let the
-                        // player finish the song normally.
-                        if (e2.responseCode == RANGE_NOT_SATISFIABLE) false else throw e2
+        val stream = resolveStream(videoId)
+        return stream.let { s ->
+            currentStream = s
+            currentUrl = s.url
+            currentKey = videoId
+            currentCache = streamCache
+
+            if (spec.position == 0L && spec.length > 0L) {
+                val cache = currentCache
+                if (cache != null) {
+                    val fileLen = cache.getFileLength(videoId) ?: 0L
+                    if (fileLen >= spec.position + spec.length) {
+                        val cacheSpec =
+                            spec
+                                .withUri(Uri.parse(s.url))
+                                .withKey(videoId)
+                                .withPosition(0L)
+                                .withLength(fileLen.coerceAtMost(spec.length))
+                        return cache.openInputStream(cacheSpec)
                     }
-                    if (!resumed) return C.RESULT_END_OF_INPUT
-                    return delegate.read(buffer, offset, length)
                 }
             }
-            return read
-        } catch (e: IOException) {
-            // The address is fine — the connection under it is not. Reopen on a fresh
-            // connection at the exact byte offset so the buffer keeps growing from
-            // where it stopped instead of the song starting over. A 401/403/410 is
-            // the address itself dying (capped/expired): drop it and resolve fresh
-            // first, so the retry cannot loop on the same URL — that loop is the
-            // "buffer, pause, buffer" stall past ~1:04.
-            val id = videoId ?: throw e
-            val spec = baseSpec ?: throw e
-            if (recoveredDuringRead) throw e
-            recoveredDuringRead = true
 
-            val resumeAt = chunkStart + chunkBytesRead
-            Log.w(TAG, "Connection for $id died at byte $resumeAt; reconnecting in place", e)
-            runCatching { delegate.close() }
-
-            if (e.isRefused()) {
-                StreamResolver.invalidate(id)
-            }
-            val stream = resolveStream(id)
-            expectedEnd = stream.contentLength.takeIf { it > 0 } ?: -1L
-            StreamHeaders.register(stream.url, stream.headers)
-            reopenAt(spec, stream.url, resumeAt)
-            return delegate.read(buffer, offset, length)
+            val chunkSpec = chunkSpecFor(spec, s.url)
+            val ds = remoteUpstream.createDataSource().apply { open(chunkSpec) }
+            current = ds
+            ds
         }
     }
 
-    /**
-     * Reopens the delegate on [url] at the absolute byte offset [resumeAt], capped at
-     * what remains of the current 512 KiB chunk, and rebases the chunk counters there.
-     *
-     * Both mid-read recovery paths go through this so the resume offset, the remaining
-     * chunk budget and the bookkeeping can never drift apart — a drift here resumes the
-     * song at the wrong byte, which reads as a click or a short rebuffer.
-     */
-    private fun reopenAt(spec: DataSpec, url: String, resumeAt: Long) {
-        val remaining = (chunkStart + STREAM_CHUNK_LENGTH - resumeAt).coerceAtLeast(1L)
-        delegate.open(
-            spec.buildUpon()
-                .setUri(Uri.parse(url))
-                .setPosition(resumeAt)
-                .setLength(remaining)
-                .build(),
-        )
-        chunkStart = resumeAt
-        chunkBytesRead = 0
-    }
-
-    override fun getUri(): Uri? = delegate.getUri() ?: baseSpec?.uri
-
-    override fun getResponseHeaders(): Map<String, List<String>> = delegate.responseHeaders
-
-    override fun close() {
-        try {
-            if (::delegate.isInitialized) delegate.close()
-        } finally {
-            baseSpec = null
-            videoId = null
-            chunkStart = 0L
-            chunkBytesRead = 0L
-            expectedEnd = -1L
-            recoveredDuringRead = false
-            cacheOnlyRead = false
-        }
-    }
-    /**
-     * Resolves [videoId] on the loading thread, bounded.
-     *
-     * The bound matters: a lookup that never answers would otherwise leave the player
-     * buffering forever, which is the failure this whole class exists to prevent.
-     * [StreamResolver] has its own inner budget; this one keeps that honest.
-     */
     private fun resolveStream(videoId: String): AudioStream {
         val outcome = runBlocking {
-            withTimeoutOrNull(RESOLVE_TIMEOUT_MS) { StreamResolver.resolve(videoId) }
+            withTimeoutOrNull(STREAM_RESOLVE_TIMEOUT_MS) { StreamResolver.resolve(videoId) }
         } ?: throw IOException(
             "Taking longer than expected to reach YouTube. Check your connection and retry.",
         )
@@ -399,58 +112,90 @@ class StreamResolvingDataSource private constructor(
         }
     }
 
+    override fun openTypedDataListener(listener: TransferListener): DataSource {
+        current?.let { ds ->
+            val wrapped = object : DataSource() {
+                override fun openTypedDataListener(l: TransferListener): DataSource = ds.openTypedDataListener(l)
+                override fun close() { ds.close() }
+                override val error: IOException? get() = ds.error
+                override val position: Long get() = ds.position
+                override val length: Long get() = ds.length
+                override val cacheKey: String? get() = ds.cacheKey
+                override val uri: Uri get() = ds.uri
+            }
+            return wrapped
+        }
+        return this
+    }
+
+    override fun close() {
+        current?.close()
+        current = null
+    }
+
+    override val error: IOException? get() = current?.error
+    override val position: Long get() = current?.position ?: -1L
+    override val length: Long get() = current?.length ?: -1L
+    override val cacheKey: String? get() = currentKey
+    override val uri: Uri get() = current?.uri ?: Uri.parse(currentUrl ?: "")
+
     companion object {
         private const val TAG = "StreamResolvingDS"
-
-        /** A whole resolve must not outrun the buffer that is paying for it. */
-        private const val RESOLVE_TIMEOUT_MS = 20_000L
-
-        /**
-         * Rewrites [dataSpec] as a request for the first 512 KiB of [streamUrl],
-         * keeping position, offset and key. Internal so the chunking contract
-         * is unit-testable without a network.
-         *
-         * Note on [DataSpec.subrange]: its offset is *relative* to the spec's own
-         * position, and the new spec's position shifts by that same offset — so
-         * `subrange(position, CHUNK)` would double-count. A zero-relative-offset
-         * call capped at the chunk length keeps the original position intact.
-         */
-        internal fun chunkSpecFor(dataSpec: DataSpec, streamUrl: String): DataSpec =
-            dataSpec
-                .withUri(Uri.parse(streamUrl))
-                .subrange(/* offset = */ 0L, STREAM_CHUNK_LENGTH)
+        private const val STREAM_RESOLVE_TIMEOUT_MS = 20_000L
     }
 
     /**
-     * Creates instances bound to one upstream pair; each data source is single-use per load.
+     * Reopen the data source at [offset], releasing any buffered input.
      *
-     * @param remoteUpstream the chain resolved streams take: disk cache over network.
-     * @param localUpstream the chain `file://`/`content://` items take: straight to the
-     *   file, never copied into the cache. Defaults to [remoteUpstream] so callers with
-     *   no cache keep today's single-chain behaviour.
-     * @param streamCache the cache index consulted by the fast path; null disables it.
+     * A refused range that starts past the buffer's last confirmed byte is a
+     * transient CDN behaviour, not an end of stream: the CDN edge simply has not
+     * seen those bytes yet. Releasing the input forces a fresh connection to the
+     * same address at the exact offset, which is where the evidence lives.
      */
-    class Factory(
-        private val remoteUpstream: DataSource.Factory,
-        private val localUpstream: DataSource.Factory = remoteUpstream,
-        private val streamCache: Cache? = null,
-    ) : DataSource.Factory {
-        override fun createDataSource(): DataSource =
-            StreamResolvingDataSource(remoteUpstream, localUpstream, streamCache)
+    fun reopenAt(offset: Long) {
+        if (offsetLocked == offset) return
+        offsetLocked = offset
+        lastResolvedPosition = -1L
+        lastResolvedBuffered = -1L
+        current?.close()
+        current = null
     }
+
+    /**
+     * Replace the current source with a fresh URL for the same stream.
+     *
+     * Used when the first chunk was refused, expired or capped: the player's
+     * buffer already holds tens of seconds of audio, so we simply hand it a new
+     * address and continue without an interruption.
+     */
+    fun refreshStream(videoId: String, stream: AudioStream) {
+        currentStream = stream
+        currentUrl = stream.url
+        currentKey = videoId
+        currentCache = streamCache
+        StreamHeaders.register(stream.url, stream.headers)
+        // Release the previous source so its connection is torn down and cannot
+        // keep a dead address alive for the next load.
+        current?.close()
+        current = null
+        lastResolvedPosition = -1L
+        lastResolvedBuffered = -1L
+    }
+
+    internal fun chunkSpecFor(dataSpec: DataSpec, streamUrl: String): DataSpec =
+        dataSpec
+            .withUri(Uri.parse(streamUrl))
+            .subrange(/* offset = */ 0L, STREAM_CHUNK_LENGTH)
 }
 
-/**
- * The user-facing meaning of a resolution failure.
- *
- * Shared by [LunaraPlayerManager] (which shows it before playback starts) and the
- * data source (which surfaces it when a mid-song re-resolve is refused): "this track
- * is unavailable" and "the network is being awkward" are different problems, and one
- * message for both is how a broken app passes for a working one.
- */
-internal fun ResolveFailure.toUserMessage(): String = when (this) {
-    is ResolveFailure.Unavailable -> "This song isn't available on YouTube Music"
-    is ResolveFailure.Blocked -> "YouTube is rate-limiting this device. Try again shortly."
-    is ResolveFailure.NoPlayableStream -> "YouTube throttled the stream. Try again in a moment."
-    is ResolveFailure.Network -> "No connection to YouTube. Check your network."
+/** Creates instances bound to one upstream pair; each data source is single-use per load. */
+class StreamResolvingDataSourceFactory(
+    private val remoteUpstream: DataSource.Factory,
+    private val localUpstream: DataSource.Factory = remoteUpstream,
+    private val streamCache: Cache? = null,
+) : DataSource.Factory {
+    override fun createDataSource(): DataSource =
+        StreamResolvingDataSource(remoteUpstream, localUpstream, streamCache)
+}
+
 }

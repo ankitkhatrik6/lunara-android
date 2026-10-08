@@ -69,14 +69,19 @@ class LunaraMediaSessionService : MediaSessionService() {
         // place InnerTune and Blazify put theirs: bytes already played are served from
         // disk on a replay or a back-seek, and only gaps reach the network. Local
         // file/content URIs never enter it — the resolving layer routes them down
-        // [networkFactory] directly.
+        // [networkFactory] directly. Null when the cache directory is unusable, in
+        // which case remoteFactory itself takes every load (no caching, no crash).
         val diskCache = StreamDiskCache.get(this)
-        val cachedFactory = CacheDataSource.Factory()
-            .setCache(diskCache)
-            .setUpstreamDataSourceFactory(networkFactory)
-            // A corrupt or evicted-underfoot cache entry must degrade into a network
-            // read, not into a playback error.
-            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        val remoteFactory = if (diskCache != null) {
+            CacheDataSource.Factory()
+                .setCache(diskCache)
+                .setUpstreamDataSourceFactory(networkFactory)
+                // A corrupt or evicted-underfoot cache entry must degrade into a network
+                // read, not into a playback error.
+                .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        } else {
+            networkFactory
+        }
         // The resolving layer sits *above* the cache so it can turn a schemeless
         // video id into an http URL (and local content:// / file URIs pass straight
         // through it untouched), and so its fast path can ask the cache index whether
@@ -89,7 +94,7 @@ class LunaraMediaSessionService : MediaSessionService() {
         // few sniffs on a local file.
         val mediaSourceFactory =
             DefaultMediaSourceFactory(
-                StreamResolvingDataSource.Factory(cachedFactory, networkFactory, diskCache),
+                StreamResolvingDataSource.Factory(remoteFactory, networkFactory, diskCache),
                 DefaultExtractorsFactory().setConstantBitrateSeekingEnabled(true),
             )
 

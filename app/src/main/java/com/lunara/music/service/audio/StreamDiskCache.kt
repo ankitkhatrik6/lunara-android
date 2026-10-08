@@ -36,8 +36,12 @@ object StreamDiskCache {
     @Volatile
     private var cache: SimpleCache? = null
 
-    /** Returns the process-wide cache, creating it on first use. */
-    fun get(context: Context): Cache {
+    /** Returns the process-wide cache, creating it on first use — or null when the
+     * cache directory is unusable (a lock left behind, a full disk). Null is a
+     * normal value here, not an error: the resolving data source simply takes the
+     * network path for every open, which is exactly how the app behaved before the
+     * cache existed. */
+    fun get(context: Context): Cache? {
         cache?.let { return it }
         synchronized(this) {
             cache?.let { return it }
@@ -54,7 +58,7 @@ object StreamDiskCache {
                 // data source simply takes the network path for every open, which is
                 // exactly how the app behaved before the cache existed.
                 Log.w(TAG, "Stream disk cache unavailable; streaming without it", it)
-                return@getOrElse null
+                return null
             }
             cache = created
             return created

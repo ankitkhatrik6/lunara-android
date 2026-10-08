@@ -2,6 +2,7 @@ package com.lunara.music.data.models
 
 import com.lunara.extractor.StreamQuality
 import com.lunara.music.database.SongEntity
+import kotlin.math.pow
 
 data class Song(
     val id: String,

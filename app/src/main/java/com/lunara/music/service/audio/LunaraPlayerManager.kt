@@ -768,7 +768,9 @@ object LunaraPlayerManager {
                     Log.w(TAG, "Prefetch resolve failed for $videoId: ${e.message}")
                     null
                 } ?: return@launch
-                StreamHeaders.register(short.url, short.headers)
+                if (short is StreamResolver.Outcome.Success) {
+                    StreamHeaders.register(short.stream.url, short.stream.headers)
+                }
             }
         }
     }

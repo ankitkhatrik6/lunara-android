@@ -1,6 +1,7 @@
 package com.lunara.music.service.audio
 
 import com.lunara.extractor.StreamQuality
+import com.lunara.music.data.models.normalizationGainFor
 import com.lunara.music.data.models.streamQualityFor
 import org.junit.Assert.assertEquals
 import org.junit.Test

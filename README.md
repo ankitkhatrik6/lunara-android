@@ -118,7 +118,7 @@ Measured against the live API while building this:
 
 | Symptom | Cause | What Lunara does |
 |---------|-------|------------------|
-| Resolves fine, then buffers forever | Media capped at exactly 1 MiB; Media3 reads the first megabyte, asks for more, gets `403` | Mint a BotGuard PO token first, so the CDN serves the whole file |
+| Resolves fine, then stops around one minute | Media capped at exactly 1 MiB; Media3 reads the first megabyte, asks for more, gets `403` — the streaming PO token was percent-encoded (`%2B`/`%2F`/`%3D` escapes the CDN refused) | Mint a BotGuard PO token first and attach `pot=` as URL-safe base64, so the CDN serves the whole file |
 | `LOGIN_REQUIRED` on every track | The request presented an identity the catalogue has stopped recognising | Visitor identity is minted per session and **renewed automatically** when every client refuses at once |
 | Sixteen seconds before anything plays | Every play tried five clients, four of which cannot ever work | Client health scoring tries the working one first and rests the rest |
 | Nothing plays at all | A speculative probe of a *different connection* from the player's — first-byte (v2.2.2), then deep-range (v2.2.3) — saw a `403` and vetoed streams the player would have read fine; with every candidate rejected, resolve failed after a few seconds of buffering | **No probing at all, Blazify's exact rule:** resolve, finalize, hand the URL to the player. A dead address costs one in-place heal on the player's own connection. Probe checks survive only for downloads, where a silent truncation really matters |
